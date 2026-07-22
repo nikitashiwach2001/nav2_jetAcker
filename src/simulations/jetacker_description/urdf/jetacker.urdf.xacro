@@ -1,0 +1,374 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="jetacker" xmlns:xacro="http://ros.org/wiki/xacro" >
+  <xacro:property name="M_PI"               value="3.1415926535897931"/>
+  <xacro:property name="base_link_mass"     value="1.6" /> 
+  <xacro:property name="base_link_w"        value="0.296"/>
+  <xacro:property name="base_link_h"        value="0.16"/>
+  <xacro:property name="base_link_d"        value="0.126"/>
+
+  <xacro:property name="body_link_mass"     value="1.6" /> 
+  <xacro:property name="body_link_w"        value="0.22"/>
+  <xacro:property name="body_link_h"        value="0.17"/>
+  <xacro:property name="body_link_d"        value="0.095"/>
+
+  <xacro:property name="wheel_link_mass"    value="0.1" />
+  <xacro:property name="wheel_link_radius"  value="0.05"/>
+  <xacro:property name="wheel_link_length"  value="0.039"/>
+
+  <link name="base_footprint"/>
+
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0.0 0.0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="w_link"/>
+  <joint
+    name="w_joint"
+    type="revolute">
+    <origin
+      xyz="0 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="link1" />
+    <child
+      link="w_link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-2.09"
+      upper="2.09"
+      effort="1000"
+      velocity="10" />
+  </joint>
+  <link
+    name="base_link">
+    <xacro:box_inertial m="${base_link_mass}" w="${base_link_w}" h="${base_link_h}" d="${base_link_d}"/>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/base_link.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin
+        xyz="-0.004 0 ${base_link_d/2 + 0.022}"
+        rpy="0 0 0" />
+      <geometry>
+        <box size="${base_link_w} ${base_link_h} ${base_link_d}" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="back_shell_link">
+    <xacro:box_inertial m="${body_link_mass}" w="${body_link_w}" h="${body_link_h}" d="${body_link_d}"/>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/back_shell_link.STL" />
+      </geometry>
+      <material name="green"/>
+    </visual>
+    <collision>
+      <origin
+        xyz="-0.04 0 ${base_link_d + 0.022 + body_link_d/2}"
+        rpy="0 0 0" />
+      <geometry>
+        <box size="${body_link_w} ${body_link_h} ${body_link_d}" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="back_shell_joint"
+    type="fixed">
+    <origin
+      xyz="0 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="back_shell_link" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="link1">
+    <inertial>
+      <origin
+        xyz="0.000273458158848059 4.49697391709507E-08 0.0127682239974202"
+        rpy="0 0 0" />
+      <mass
+        value="0.0117617552923888" />
+      <inertia
+        ixx="2.42304907313034E-06"
+        ixy="8.36427578709212E-13"
+        ixz="-4.88815706874446E-08"
+        iyy="2.24167366920736E-06"
+        iyz="2.4783598093895E-12"
+        izz="3.78066563706159E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/link1.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+  </link>
+  <joint
+    name="joint1"
+    type="revolute">
+    <origin
+      xyz="0.031299 0.00068637 0.16156"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="link1" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-2.09"
+      upper="2.09"
+      effort="1000"
+      velocity="10" />
+  </joint>
+  <link
+    name="depth_cam_link">
+    <inertial>
+      <origin
+        xyz="-0.00267477609208174 -1.63263137193841E-05 -0.00522210299748882"
+        rpy="0 0 0" />
+      <mass
+        value="0.22552781639362" />
+      <inertia
+        ixx="0.000408522155796754"
+        ixy="-7.65921501012663E-09"
+        ixz="1.66771046033071E-07"
+        iyy="4.81468336120099E-05"
+        iyz="-5.69880969191004E-09"
+        izz="0.000428962116485588" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/depth_cam_link.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+  </link>
+  <joint
+    name="depth_cam_joint"
+    type="fixed">
+    <origin
+      xyz="0.0057651 0.00025 0.057913"
+      rpy="0 0 0" />
+    <parent
+      link="link1" />
+    <child
+      link="depth_cam_link" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="lidar_link">
+    <inertial>
+      <origin
+        xyz="-0.00221931680115031 0.000376419599582719 -0.0173018800523995"
+        rpy="0 0 0" />
+      <mass
+        value="0.0438457545362112" />
+      <inertia
+        ixx="1.59958556469832E-05"
+        ixy="4.53029353441676E-08"
+        ixz="2.33892337631863E-07"
+        iyy="2.04183700013467E-05"
+        iyz="-1.10000396493279E-08"
+        izz="3.50483610398295E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/lidar_link.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+  </link>
+  <joint
+    name="lidar_joint"
+    type="fixed">
+    <origin
+      xyz="0.10414 0.000685 0.13378"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="lidar_link" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link name="lidar_sim_frame" />
+  <joint
+    name="lidar_sim_frame_joint"
+    type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 ${M_PI}" />
+    <parent link="lidar_link" />
+    <child link="lidar_sim_frame" />
+  </joint>
+  <link
+    name="wheel_right_front">
+    <xacro:cylinder_inertial m="${wheel_link_mass}" r="${wheel_link_radius}" h="${wheel_link_length}" />
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/wheel_right_front.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 -0.019 0"
+        rpy="${M_PI/2} 0 0" />
+      <geometry>
+        <cylinder length="${wheel_link_length}" radius="${wheel_link_radius}"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="wheel_right_front_joint"
+    type="fixed">
+    <origin
+      xyz="0.10733 -0.091241 0.050002"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="wheel_right_front" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="wheel_right_back">
+    <xacro:cylinder_inertial m="${wheel_link_mass}" r="${wheel_link_radius}" h="${wheel_link_length}" />
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/wheel_right_back.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 -0.019 0"
+        rpy="${M_PI/2} 0 0" />
+      <geometry>
+        <cylinder length="${wheel_link_length}" radius="${wheel_link_radius}"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="wheel_right_back_joint"
+    type="fixed">
+    <origin
+      xyz="-0.106 -0.091444 0.050335"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="wheel_right_back" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="wheel_left_back">
+    <xacro:cylinder_inertial m="${wheel_link_mass}" r="${wheel_link_radius}" h="${wheel_link_length}" />
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/wheel_left_back.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0.019 0"
+        rpy="${M_PI/2} 0 0" />
+      <geometry>
+        <cylinder length="${wheel_link_length}" radius="${wheel_link_radius}"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="wheel_left_back_joint"
+    type="fixed">
+    <origin
+      xyz="-0.10599 0.090107 0.050328"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="wheel_left_back" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="wheel_left_front">
+    <xacro:cylinder_inertial m="${wheel_link_mass}" r="${wheel_link_radius}" h="${wheel_link_length}" />
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://jetacker_description/meshes/wheel_left_front.STL" />
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0.019 0"
+        rpy="${M_PI/2} 0 0" />
+      <geometry>
+        <cylinder length="${wheel_link_length}" radius="${wheel_link_radius}"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="wheel_left_front_joint"
+    type="fixed">
+    <origin
+      xyz="0.10734 0.092607 0.049998"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="wheel_left_front" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+</robot>

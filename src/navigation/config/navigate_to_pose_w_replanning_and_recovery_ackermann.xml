@@ -1,0 +1,48 @@
+<!--
+  Copy of nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml adapted for a
+  forward-only Ackermann base: Spin removed (a car-like robot cannot rotate in place, so the
+  default Spin recovery just times out), BackUp promoted to the first motion recovery so the
+  robot reverses out of dead-ends, then costmaps are cleared and the planner replans at 1 Hz.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <!-- retries generous: each dead-end escape consumes 1-2 recovery rounds and the counter
+         never resets within a goal; 6 (default) made long runs abort after a few stucks -->
+    <RecoveryNode number_of_retries="25" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <!-- Keep the current path while the goal is unchanged and the path is still
+                 collision-free; replan ONLY when it becomes invalid. Unconditional 1 Hz
+                 replanning regenerated the path from the robot's latest pose every second,
+                 shifting the resampled waypoints under the RL controller for no reason. -->
+            <Fallback name="KeepPathOrReplan">
+              <ReactiveSequence name="PathStillGood">
+                <Inverter>
+                  <GlobalUpdatedGoal/>
+                </Inverter>
+                <IsPathValid path="{path}"/>
+              </ReactiveSequence>
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            </Fallback>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <BackUp backup_dist="0.40" backup_speed="0.08"/>
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

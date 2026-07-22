@@ -1,0 +1,5 @@
+<library path="rl_controller">
+  <class name="rl_nav_cpp/RLController"
+         type="RLController"
+         base_class_type="nav2_core::Controller"/>
+</library>

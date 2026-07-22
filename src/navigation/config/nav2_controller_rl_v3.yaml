@@ -1,0 +1,56 @@
+controller_server:
+  ros__parameters:
+    use_sim_time: False
+    controller_frequency: 30.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # radius stays BELOW the controller's reverse_dist (0.8) so a completed reverse
+      # escape resets this timer instead of counting as "no progress" and aborting
+      required_movement_radius: 0.25
+      movement_time_allowance: 10.0
+
+    # Ackermann cannot turn in place -> keep yaw tolerance loose (no final spin-to-heading)
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 3.15
+
+    FollowPath:
+      plugin: "rl_nav_cpp/RLControllerV3"
+      model_path: "/home/ubuntu/ros2_ws/src/rl_nav_cpp/carrot_l6.onnx"
+      goal_change_thresh: 0.5      # m endpoint move that resets the GRU (new goal vs replan)
+      # same yaw-180 lidar mount as v1/v2 -- see rl_controller.cpp header for the tf2_echo confirmation
+      lidar_angle_offset: 3.14159265
+      lidar_ccw: True
+      # DEPLOY SPEED: spec target is a fixed 0.60 m/s, "no governor". Untested on real
+      # hardware with this model -- start LOW and ramp up during field testing. Also note
+      # navigation/config/nav2_params.yaml velocity_smoother max_velocity is currently
+      # capped at 0.26 regardless of this param (raise it there once ready for full speed).
+      speed_scale: 0.25
+      # if robot steers WRONG way on a straight path, flip to -1.0 (live, no rebuild):
+      #   ros2 param set /controller_server FollowPath.steer_sign -1.0
+      steer_sign: 1.0
+      estop_distance: 0.30         # m; blocker in the driving corridor closer than this -> stop (0 disables)
+      estop_release: 0.40          # m; hysteresis: resume only after the corridor clears past this
+      estop_half_width: 0.17       # m; corridor half-width (robot half-width 0.11 + margin)
+      reverse_clear: 0.55          # m; reverse until the corridor ahead is clear past this...
+      reverse_dist: 0.80           # m; ...capped at this distance
+      reverse_rear_stop: 0.22      # m; rear bumper is ~0.16 m behind the lidar
+      estop_fail_sec: 1.5          # s; stuck this long -> built-in reverse recovery
+      # this model, like v1, was NOT trained to reverse -- all reverse motion here is the
+      # same hardcoded steered-reverse recovery v1 uses (rl_controller.cpp), unchanged.
+      debug: True
+
+controller_server_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False

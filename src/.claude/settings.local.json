@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"lin_speed\\\\|ang_speed\\\\|LaserVelocity\\\\|laser_pose\" /home/ubuntu/third_party/third_party_ws/src/rf2o_laser_odometry/src/CLaserOdometry2D.cpp | head -15; echo \"---setLaserPoseFromTf---\"; grep -n -A15 \"setLaserPoseFromTf\" /home/ubuntu/third_party/third_party_ws/src/rf2o_laser_odometry/src/CLaserOdometry2DNode.cpp | head -30)",
+      "Read(//home/ubuntu/third_party/third_party_ws/src/rf2o_laser_odometry/src/**)"
+    ]
+  }
+}

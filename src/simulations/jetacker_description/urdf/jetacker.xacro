@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="jetacker" xmlns:xacro="http://ros.org/wiki/xacro">
+    <xacro:property name="lidar"        value="$(env LIDAR_TYPE)"/>
+
+    <xacro:include filename="$(find jetacker_description)/urdf/materials.xacro"/>
+    <xacro:include filename="$(find jetacker_description)/urdf/inertial_matrix.xacro"/>
+    <xacro:include filename="$(find jetacker_description)/urdf/imu.urdf.xacro"/>
+    <xacro:if value="${lidar in ['A1', 'A2', 'S2L', 'LD14P']}">
+        <xacro:include filename="$(find jetacker_description)/urdf/lidar_a1.urdf.xacro"/>
+    </xacro:if>
+    <xacro:if value="${lidar in ['G4']}">
+        <xacro:include filename="$(find jetacker_description)/urdf/lidar_g4.urdf.xacro"/>
+    </xacro:if>
+    <xacro:include filename="$(find jetacker_description)/urdf/jetacker.urdf.xacro"/>
+</robot>
