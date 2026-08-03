@@ -106,7 +106,7 @@ public:
     logger_ = node_->get_logger();
     plugin_name_ = name;
 
-    declareParam("model_path", "/home/ubuntu/ros2_ws/src/rl_nav_cpp/policy_reverse_15995.onnx");
+    declareParam("model_path", "/home/ubuntu/ros2_ws/src/rl_nav_cpp/policies/policy_reverse_15995.onnx");
     // With no lookahead in the observation (idx 43-57 always zero) the model can't see the
     // path's shape beyond the current target point -- keep waypoints closer together than v1's
     // 2.0m so the carrot still roughly traces the Nav2 plan. Tune during field testing.

@@ -1,12 +1,32 @@
+# /scan = filtered output of /scan_raw. Consumers: AMCL (scan_topic: scan) and BOTH nav2
+# costmaps (obstacle/voxel layer topic: /scan). rf2o, the collision monitor and the RL
+# controller read /scan_raw directly and were never affected by this file.
+#
+# 2026-07-28 -- REMOVED the angular bounds filter that used to be filter1:
+#     type: laser_filters/LaserScanAngularBoundsFilterInPlace
+#     params: {lower_angle: -1.6, upper_angle: 1.6}
+# It KEEPS the rays inside +/-1.6 rad of the SCAN frame's zero. lidar_frame is mounted yawed
+# 180 deg from base_footprint (URDF lidar_a1.urdf.xacro: rpy "0 0 M_PI"), so scan angle 0 is
+# the robot's TAIL -- the filter was keeping exactly the sector the robot's own structure
+# occludes and throwing away the fully-valid front. Measured on three consecutive live scans
+# (2026-07-28): the no-return wedge spans robot bearings 105..263 deg == scan frame -75..+83
+# deg, entirely inside what this filter kept. So /scan carried ~25 deg of usable data out of
+# 360, and AMCL plus both costmaps were running on it:
+#   - AMCL mis-localized -> the robot's believed pose ended up INSIDE a mapped wall, and
+#     SmacPlannerHybrid then refuses every goal with "Starting point in lethal space!"
+#     (recorded 2026-07-28 19:42; clearing costmaps cannot help, the cells come from the
+#     static map) -> navigation dead until relaunch.
+#   - both costmaps got almost no live obstacle data, so only the static map was ever in them.
+# The rays this filter was meant to drop (self-occluded) already come back as inf from the
+# driver, which AMCL's likelihood_field model skips and the costmap projector drops, so no
+# angular filtering is needed at all. The angular-bounds filter cannot express "keep
+# everything EXCEPT a sector", which is what a 180-deg-yawed mount would need.
+#
+# If the lidar is ever remounted so scan 0 points forward, re-add the angular filter AND set
+# navigation/config/nav2_controller_rl_v5.yaml lidar_angle_offset back to 0.0.
 /**:
   ros__parameters:
     filter1:
-      name: scan
-      type: laser_filters/LaserScanAngularBoundsFilterInPlace
-      params:
-        lower_angle: -1.6
-        upper_angle: 1.6
-    filter2:
       name: box_filter
       type: laser_filters/LaserScanRangeFilter
       params:

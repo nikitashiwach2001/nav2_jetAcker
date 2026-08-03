@@ -6,30 +6,66 @@
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <!-- retries generous: each dead-end escape consumes 1-2 recovery rounds and the counter
-         never resets within a goal; 6 (default) made long runs abort after a few stucks -->
-    <RecoveryNode number_of_retries="25" name="NavigateRecovery">
+    <!-- 2026-07-28: raised 3 -> 60. "Fail fast" was the right call only while a wedged robot
+         was unrecoverable; with the Escape planner below it can now plan its way out, so
+         giving up after ~40 s just aborts a goal that would have succeeded. The requirement
+         is: never abort, keep trying, and if the goal itself is blocked get as close as the
+         planner's 1.0 m tolerance allows. Lower this again if you ever want a genuine
+         "unreachable goal" report instead of indefinite retrying. -->
+    <RecoveryNode number_of_retries="60" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-            <!-- Keep the current path while the goal is unchanged and the path is still
-                 collision-free; replan ONLY when it becomes invalid. Unconditional 1 Hz
+            <!-- Keep the current path while the goal is unchanged, the path is still
+                 collision-free, AND it isn't stale -- replan otherwise. Unconditional 1 Hz
                  replanning regenerated the path from the robot's latest pose every second,
-                 shifting the resampled waypoints under the RL controller for no reason. -->
+                 shifting the resampled waypoints under the RL controller for no reason, so
+                 that was removed. But IsPathValid alone only checks "is this path still
+                 collision-free" -- it says nothing about whether the ROBOT is still
+                 sensibly positioned relative to it. If the robot ends up off-path (wrong
+                 turn, oscillation) while the path itself stays obstacle-free, IsPathValid
+                 never fails and the stale path gets reused forever, so the robot never
+                 gets a fresh plan from where it actually is. PathExpiringTimer bounds this:
+                 forces a real replan (from the robot's current pose) after 8 s even if
+                 nothing ever became "invalid". Resets automatically whenever the path
+                 actually changes, so a robot making good progress never notices it. -->
             <Fallback name="KeepPathOrReplan">
               <ReactiveSequence name="PathStillGood">
                 <Inverter>
                   <GlobalUpdatedGoal/>
                 </Inverter>
                 <IsPathValid path="{path}"/>
+                <Inverter>
+                  <PathExpiringTimer seconds="8.0" path="{path}"/>
+                </Inverter>
               </ReactiveSequence>
               <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              <!-- Hybrid-A* refuses to plan at all when the robot's own pose overlaps lethal
+                   cells ("Starting point in lethal space"), which is unrecoverable on its own:
+                   the cells come from the static map, so no amount of costmap clearing or
+                   BackUp fixes it, and every later goal fails to plan too (observed
+                   2026-07-28 -- navigation was dead until relaunch). NavFn clears the robot
+                   cell before planning, so it still returns a path out of the wedge. Only
+                   reached when GridBased has already failed; the next replan goes back to
+                   GridBased once the robot is clear. See planner_server.Escape in
+                   nav2_params.yaml. -->
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="Escape"/>
             </Fallback>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
           </RecoveryNode>
         </RateController>
         <RecoveryNode number_of_retries="1" name="FollowPath">
-          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <!-- RL first (2 tries, with a local costmap clear between them via the inner
+               RecoveryNode) -- if it keeps throwing "boxed in" / oscillating, fall back to
+               TEB (controller_id="FollowPathTEB", config/nav2_controller_rl.yaml) so the
+               robot still actually reaches the goal instead of the whole action aborting. -->
+          <Fallback name="RLThenTEBFallback">
+            <RecoveryNode number_of_retries="2" name="FollowPathRL">
+              <FollowPath path="{path}" controller_id="FollowPath"/>
+              <ClearEntireCostmap name="ClearLocalCostmap-RL" service_name="local_costmap/clear_entirely_local_costmap"/>
+            </RecoveryNode>
+            <FollowPath path="{path}" controller_id="FollowPathTEB"/>
+          </Fallback>
           <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
         </RecoveryNode>
       </PipelineSequence>

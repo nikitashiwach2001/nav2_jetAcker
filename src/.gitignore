@@ -1,0 +1,14 @@
+/home/ubuntu/ros2_ws/src/rl_nav_cpp/policies
+
+/home/ubuntu/ros2_ws/src/example 
+
+
+/home/ubuntu/ros2_ws/src/app
+
+/home/ubuntu/ros2_ws/src/Log
+
+/home/ubuntu/ros2_ws/src/calibration
+
+cd /home/ubuntu/ros2_ws && colcon build --packages-select rl_nav_cpp 2>&1 | tail -40
+
+cd /home/ubuntu/ros2_ws && colcon build --packages-select navigation 2>&1 | tail -40

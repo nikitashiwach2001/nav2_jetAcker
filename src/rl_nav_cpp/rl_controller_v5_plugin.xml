@@ -1,0 +1,8 @@
+
+
+
+<library path="rl_controller_v5">
+  <class name="rl_nav_cpp/RLControllerV5"
+         type="RLControllerV5"
+         base_class_type="nav2_core::Controller"/>
+</library>

@@ -22,12 +22,12 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.40
       yaw_goal_tolerance: 3.15
 
     FollowPath:
       plugin: "rl_nav_cpp/RLControllerV3"
-      model_path: "/home/ubuntu/ros2_ws/src/rl_nav_cpp/carrot_l6.onnx"
+      model_path: "/home/ubuntu/ros2_ws/src/rl_nav_cpp/policies/carrot_l6.onnx"
       goal_change_thresh: 0.5      # m endpoint move that resets the GRU (new goal vs replan)
       # same yaw-180 lidar mount as v1/v2 -- see rl_controller.cpp header for the tf2_echo confirmation
       lidar_angle_offset: 3.14159265

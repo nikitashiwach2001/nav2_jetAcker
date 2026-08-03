@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Heading-free goal sending: click with RViz "Publish Point" instead of "Nav2 Goal".
+"""Heading-free goal sending for BOTH RViz goal tools.
+
+2026-07-28: this node used to serve only the "Publish Point" tool, so goals sent with the
+normal "2D Goal Pose"/"Nav2 Goal" arrow went straight to bt_navigator with whatever heading
+the arrow happened to have -- and a heading that fights the approach direction (robot facing
+east, arrow pointing west) forces a minimum-radius loop into the path, which in a tight space
+has nowhere to fit: the robot shuffles back and forth, ends up against a wall, and navigation
+wedges. It now also subscribes to /goal_pose (the arrow tool) and republishes on
+/goal_pose_nav, which is what bt_navigator listens to (remapped in
+navigation/launch/include/navigation_base_v5.launch.py). An arrow heading is KEPT when it
+plans well (<= GOOD_RATIO x beeline) and only replaced when it produces a loopy path.
+NOTE: with that remap, goals only reach bt_navigator through this node -- if it is not
+running, publish directly to /goal_pose_nav.
 
 Humble's SmacPlannerHybrid always plans to the goal's EXACT heading (no
 goal_heading_mode), and with the forward-only DUBIN motion model a heading that
@@ -46,11 +58,12 @@ class GoalPointRelay(Node):
         super().__init__('goal_point_relay')
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.goal_pub = self.create_publisher(PoseStamped, 'goal_pose', 1)
+        self.goal_pub = self.create_publisher(PoseStamped, 'goal_pose_nav', 1)
         self.planner = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
         self.create_subscription(PointStamped, 'clicked_point', self.on_click, 1)
-        self.get_logger().info('goal_point_relay ready: use the RViz "Publish Point" tool '
-                               'to send heading-free navigation goals')
+        self.create_subscription(PoseStamped, 'goal_pose', self.on_goal_pose, 1)
+        self.get_logger().info('goal_point_relay ready: both the RViz "Publish Point" and '
+                               '"2D Goal Pose" tools now get a loop-free heading')
 
     def make_goal(self, msg, yaw):
         goal = PoseStamped()
@@ -79,7 +92,17 @@ class GoalPointRelay(Node):
             return None
         return path_length(res.result.path)
 
-    def on_click(self, msg: PointStamped):
+    def on_goal_pose(self, msg: PoseStamped):
+        """RViz "2D Goal Pose" arrow. Keep the requested heading if it plans cleanly,
+        otherwise fall back to the same search the Publish Point tool uses."""
+        pt = PointStamped()
+        pt.header = msg.header
+        pt.point = msg.pose.position
+        q = msg.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.on_click(pt, requested_yaw=yaw)
+
+    def on_click(self, msg: PointStamped, requested_yaw=None):
         frame = msg.header.frame_id or 'map'
         try:
             tf = self.tf_buffer.lookup_transform(frame, ROBOT_FRAME,
@@ -93,10 +116,15 @@ class GoalPointRelay(Node):
         beeline = math.hypot(msg.point.x - rx, msg.point.y - ry)
         bearing = math.atan2(msg.point.y - ry, msg.point.x - rx)
 
-        best_yaw, best_len = bearing, None
+        # an arrow heading is the user's explicit intent: try it first and keep it if the plan
+        # is not loopy; the straight robot->goal bearing is the first fallback
+        candidates = [bearing + off for off in OFFSETS]
+        if requested_yaw is not None:
+            candidates.insert(0, requested_yaw)
+
+        best_yaw, best_len = (requested_yaw if requested_yaw is not None else bearing), None
         if self.planner.wait_for_server(timeout_sec=1.0):
-            for off in OFFSETS:
-                yaw = bearing + off
+            for yaw in candidates:
                 length = self.try_plan(self.make_goal(msg, yaw))
                 if length is None:
                     continue

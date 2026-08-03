@@ -13,6 +13,7 @@ find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav2_core REQUIRED)
 find_package(pluginlib REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -129,5 +130,58 @@ install(TARGETS rl_controller_v3
 )
 
 pluginlib_export_plugin_description_file(nav2_core rl_controller_v3_plugin.xml)
+
+# --- v4 controller (parallel plugin, does not replace rl_controller/v2/v3) ---
+add_library(rl_controller_v4 SHARED src/rl_controller_v4.cpp)
+
+set_target_properties(rl_controller_v4 PROPERTIES
+  BUILD_RPATH ${ONNX_DIR}/lib
+  INSTALL_RPATH ${ONNX_DIR}/lib)
+
+target_link_libraries(rl_controller_v4 onnxruntime)
+
+ament_target_dependencies(rl_controller_v4
+  rclcpp
+  nav2_core
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
+  pluginlib
+)
+
+install(TARGETS rl_controller_v4
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+pluginlib_export_plugin_description_file(nav2_core rl_controller_v4_plugin.xml)
+
+# --- v5 controller (parallel plugin, does not replace rl_controller/v2/v3/v4) ---
+add_library(rl_controller_v5 SHARED src/rl_controller_v5.cpp)
+
+set_target_properties(rl_controller_v5 PROPERTIES
+  BUILD_RPATH ${ONNX_DIR}/lib
+  INSTALL_RPATH ${ONNX_DIR}/lib)
+
+target_link_libraries(rl_controller_v5 onnxruntime)
+
+ament_target_dependencies(rl_controller_v5
+  rclcpp
+  nav2_core
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
+  pluginlib
+  tf2_ros
+)
+
+install(TARGETS rl_controller_v5
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+pluginlib_export_plugin_description_file(nav2_core rl_controller_v5_plugin.xml)
 
 ament_package()

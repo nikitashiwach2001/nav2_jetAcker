@@ -38,6 +38,12 @@ amcl:
     z_rand: 0.5
     z_short: 0.05
     scan_topic: scan
+    # Was hardcoded to (0,0,0) -- AMCL always "believed" it started at map origin
+    # regardless of where the robot physically was, causing wrong localization anywhere
+    # else. False -> AMCL does proper GLOBAL localization: particles spread across the
+    # whole free space of the map and converge from real scan-matching as the robot
+    # moves, correct no matter where it actually starts. Takes a little driving to
+    # converge tightly at first, but is accurate everywhere instead of only at one point.
     set_initial_pose: True
     initial_pose: 
       x: 0.0
@@ -141,12 +147,17 @@ local_costmap:
       # Real JetAcker outline (base_footprint at rear axle: 0.296 m body + front wheels,
       # ~0.2 m wide). Also feeds local_costmap/published_footprint, which the collision
       # monitor's "approach" polygon uses for velocity-aware stopping.
-      footprint: "[[0.28, 0.11], [0.28, -0.11], [-0.16, -0.11], [-0.16, 0.11]]"
+      footprint: "[[0.30, 0.13], [0.30, -0.13], [-0.18, -0.13], [-0.18, 0.13]]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
+        # reverted 2026-07-30: 0.45/3.5 caused hesitant/roundabout paths in congested
+        # areas -- real collision safety comes from footprint (hard boundary, below) and
+        # the RL controller's own lidar-based estop/corridor checks (unaffected by this
+        # value either way), so a wider inflation was pure cost-preference overhead with
+        # no safety benefit in tight spaces. Narrowed further (0.35->0.25) same reasoning.
         cost_scaling_factor: 5.0
-        inflation_radius: 0.35
+        inflation_radius: 0.25
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -189,7 +200,7 @@ global_costmap:
       use_sim_time: False
       # Real robot outline so global plans keep feasible clearance instead of hugging
       # walls a 0.05 m "dot" could pass but the 0.2 m-wide car cannot (dead-end trap).
-      footprint: "[[0.28, 0.11], [0.28, -0.11], [-0.16, -0.11], [-0.16, 0.11]]"
+      footprint: "[[0.30, 0.13], [0.30, -0.13], [-0.18, -0.13], [-0.18, 0.13]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -212,8 +223,12 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
+        # reverted 2026-07-30 -- see local_costmap's inflation_layer comment: caused
+        # hesitant/roundabout paths in congested areas, no actual safety benefit since
+        # real collision avoidance is via footprint + the RL controller's lidar checks.
+        # Narrowed further (0.35->0.25) same reasoning.
         cost_scaling_factor: 5.5
-        inflation_radius: 0.35
+        inflation_radius: 0.25
       always_send_full_costmap: True
   global_costmap_client:
     ros__parameters:
@@ -246,17 +261,24 @@ planner_server:
   ros__parameters:
     expected_planner_frequency: 2.0   # Hybrid-A* is heavier than NavFn; BT replans at 1 Hz anyway
     use_sim_time: False
-    planner_plugins: ["GridBased"]
+    planner_plugins: ["GridBased", "Escape"]
     GridBased:
       plugin: "nav2_smac_planner/SmacPlannerHybrid"
-      tolerance: 0.5
+      # raised 0.5 -> 1.0 (2026-07-28): if the goal itself is boxed in, plan to the closest
+      # reachable pose within 1 m instead of failing -- "get as near as possible, never abort"
+      tolerance: 1.0
       downsample_costmap: false
       downsampling_factor: 1
       allow_unknown: true
       max_iterations: 1000000
       max_on_approach_iterations: 1000
       max_planning_time: 3.0
-      motion_model_for_search: "DUBIN"     # forward-only, bounded curvature
+      motion_model_for_search: "DUBIN"     # forward-only, bounded curvature. REEDS_SHEPP (which
+                                           # allows reverse segments) was tried but only helps a
+                                           # reverse-capable controller (v2); v1's model was never
+                                           # trained to reverse, so it just curved forward anyway
+                                           # toward waypoints meant to be backed into -- worse
+                                           # than a clean forward-only path. Revert if v1 is active.
       minimum_turning_radius: 0.35         # m; physical min is wheelbase/tan(0.6) ~= 0.31
       angle_quantization_bins: 64
       analytic_expansion_ratio: 3.5
@@ -274,6 +296,22 @@ planner_server:
         w_smooth: 0.3
         w_data: 0.2
         tolerance: 1.0e-10
+
+    # ESCAPE planner (added 2026-07-28). SmacPlannerHybrid does an SE2 footprint collision
+    # check on the START pose and refuses outright -- "Starting point in lethal space! Cannot
+    # create feasible plan" -- whenever the robot's pose overlaps lethal cells (touching a
+    # wall, or mis-localized into one). Recorded 2026-07-28 19:42: once that happened EVERY
+    # subsequent goal failed to plan, including brand new ones, and clearing the costmaps
+    # could not help because the cells came from the STATIC MAP. Navigation was dead until
+    # relaunch. NavFn clears the robot's own cell before planning, so it still produces a path
+    # out of that state. The BT tries GridBased first and only falls back to this one, so
+    # normal driving still gets Ackermann-feasible Hybrid-A* paths; this one just gets the
+    # robot un-wedged, after which the next 1 Hz replan returns to GridBased.
+    Escape:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 1.0
+      use_astar: true
+      allow_unknown: true
 
 planner_server_rclcpp_node:
   ros__parameters:
@@ -330,10 +368,14 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.26, 0.0, 1.0]
-    min_velocity: [-0.26, 0.0, -1.0]
-    max_accel: [2.5, 0.0, 3.2]
-    max_decel: [-2.5, 0.0, -3.2]
+    max_velocity: [0.36, 0.0, 1.0]
+    min_velocity: [-0.36, 0.0, -1.0]
+    # angular accel tightened 3.2 -> 1.8 rad/s^2 (2026-07-28): second-stage smoothing for
+    # left-right weave during normal RL-driven navigation, complementing each RL
+    # controller's own steer_ema_alpha filter (this acts on angular.z downstream, after
+    # the controller, at the shared velocity_smoother -- affects all of v1-v5 and TEB/DWB).
+    max_accel: [2.5, 0.0, 1.8]
+    max_decel: [-2.5, 0.0, -1.8]
     odom_topic: odom
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -373,7 +415,10 @@ collision_monitor:
       # v1 safety net, re-enabled: with the controller's e-stop now correctly oriented
       # (lidar_angle_offset fix) the robot stops 0.30 m short, so the freeze-on-contact
       # trap (points inside footprint -> all cmd_vel zeroed) should no longer be reachable.
-      enabled: True
+      # TEMPORARILY DISABLED 2026-08-03 as a diagnostic: nav2_container segfaults
+      # (exit -11) ~40 s after load, right when local_costmap activates and starts
+      # publishing published_footprint -- suspecting this approach polygon.
+      enabled: False
     observation_sources: ["scan"]
     scan:
       type: "scan"

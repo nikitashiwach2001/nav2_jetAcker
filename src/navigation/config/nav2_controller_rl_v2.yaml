@@ -24,18 +24,18 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.40
       yaw_goal_tolerance: 3.15
 
     FollowPath:
       plugin: "rl_nav_cpp/RLControllerV2"
-      model_path: "/home/ubuntu/ros2_ws/src/rl_nav_cpp/policy_reverse_15995.onnx"
-      waypoint_spacing: 1.0        # m; unused while final_goal_only is true, kept for when it's off
+      model_path: "/home/ubuntu/ros2_ws/src/rl_nav_cpp/policies/policy_reverse_15995.onnx"
+      waypoint_spacing: 1.0        # m between resampled waypoints
       goal_change_thresh: 0.5      # m endpoint move that counts as a new goal (reset prev-action)
-      # TESTING: feed only Nav2's final goal point (path endpoint), no intermediate carrot --
-      # isolates the raw policy's own point-to-point navigation + lidar avoidance. Set false to
-      # go back to waypoint-by-waypoint path following.
-      final_goal_only: True
+      # Follow the actual path shape (waypoint by waypoint), not just the final point --
+      # needed now that the global planner (REEDS_SHEPP) can produce a path with a real
+      # reverse segment; final_goal_only would skip straight to the endpoint and ignore it.
+      final_goal_only: False
       # same yaw-180 lidar mount as v1 -- see rl_controller.cpp header for the tf2_echo confirmation
       lidar_angle_offset: 3.14159265
       lidar_ccw: True

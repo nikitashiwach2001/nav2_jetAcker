@@ -1,0 +1,212 @@
+controller_server:
+  ros__parameters:
+    use_sim_time: False
+    # MUST match training: frames are stacked every 5 control steps (~0.166 s) -> 30 Hz
+    controller_frequency: 30.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    # FollowPathTEB is a FALLBACK controller: the BT (navigate_to_pose_w_replanning_and
+    # _recovery_ackermann.xml) tries FollowPath (RL) a couple times first; only if RL keeps
+    # failing (boxed in, oscillating) does it switch controller_id to this one so the robot
+    # still actually finishes the goal instead of the whole action just aborting.
+    controller_plugins: ["FollowPath", "FollowPathTEB"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # radius must stay BELOW the controller's reverse_dist (0.4) so a completed reverse
+      # escape resets this timer instead of counting as "no progress" and aborting
+      required_movement_radius: 0.25
+      movement_time_allowance: 10.0
+
+    # Ackermann cannot turn in place -> keep yaw tolerance loose (no final spin-to-heading)
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.40
+      yaw_goal_tolerance: 3.15
+
+    FollowPath:
+      plugin: "rl_nav_cpp/RLControllerV5"
+      model_path: "/home/ubuntu/ros2_ws/src/rl_nav_cpp/policies/policy_full_new.onnx"
+      waypoint_spacing: 1.0        # m between resampled carrot waypoints (training-matched value is 2.0; testing 1.0)
+      goal_change_thresh: 0.5      # m endpoint move that resets the GRU (new goal vs replan)
+      # lidar_frame is mounted yawed 180 deg from base_footprint (URDF lidar_joint, confirmed
+      # via tf2_echo: RPY [0, 0, 3.142]) -> scan angle 0 points at the robot's TAIL. Training
+      # ray 0 (robot +X) therefore sits at scan angle pi. With 0.0 here the policy saw the
+      # world back-to-front and the corridor e-stop watched the rear. TF consumers (AMCL,
+      # costmaps) were never affected -- only this controller reads raw ray angles.
+      lidar_angle_offset: 3.14159265
+      lidar_ccw: True              # pure yaw mount: rotation handedness unchanged
+      # if robot consistently, confidently steers the WRONG way (not oscillating -- commits
+      # hard to one direction and never corrects, e.g. path is clearly to one side and it
+      # just keeps heading its own current way), flip to -1.0 (live, no rebuild):
+      #   ros2 param set /controller_server FollowPath.steer_sign -1.0
+      steer_sign: 1.0
+      estop_distance: 0.30         # m; blocker in the driving corridor closer than this -> stop (0 disables)
+      estop_release: 0.40          # m; hysteresis: resume only after the corridor clears past this
+      estop_half_width: 0.17       # m; corridor half-width (robot half-width 0.11 + margin);
+                                   # corridor, NOT a cone: side walls being passed don't trigger
+      reverse_clear: 0.55          # m; reverse until the corridor ahead is clear past this...
+      reverse_dist: 0.80           # m; ...capped at this distance
+      reverse_rear_stop: 0.22      # m; rear bumper is ~0.16 m behind the lidar -- 0.30 was so
+                                   # conservative that near-rear obstacles aborted every reverse
+      estop_fail_sec: 1.5          # s; stuck this long -> built-in reverse recovery
+      throttle_scale: 0.35         # m/s at action=1 -- raised 0.25->0.35 (2026-07-30);
+                                   # velocity_smoother's max_velocity raised to 0.36 to match
+                                   # (must stay >= throttle_scale, else linear.x gets clipped
+                                   # while angular.z passes through unclipped, distorting
+                                   # curvature -- see git history for the earlier 0.6/0.26 bug).
+      dock_dist: 1.0               # m; within this of the goal -> slow pure-pursuit docking.
+                                   # Enabled 2026-07-08: goal-orbiting reappeared (robot circled
+                                   # the goal on its turning circle instead of stopping)
+      dock_speed: 0.12             # m/s docking approach speed (used only when dock_dist > 0)
+      dock_kp: 1.5                 # docking steering gain (used only when dock_dist > 0)
+      # Steering smoothing. NOTE (2026-07-28): the controller's parameter is steer_ema_alpha and
+      # alpha is the weight on the PREVIOUS command, so HIGHER = smoother/more lag (the old
+      # steer_smooth_alpha/steer_max_rate keys here were never read by v5 -- the rate cap was
+      # removed from the controller and the EMA renamed; 0.45 was silently doing nothing).
+      steer_ema_alpha: 0.7
+      steer_deadband: 0.02         # rad; commands below this go out as 0 (kills the micro-weave
+                                   # that the servo cannot resolve anyway). 0 disables.
+
+      # ---- path tracking (added 2026-07-28) ----
+      # Fixes: robot weaves down straight sections, drifts off the plan and -- being a
+      # forward-only waypoint chaser with no cross-track term -- never comes back, so long
+      # goals with turns or an obstacle in the way fail outright.
+      # The dense plan is now tracked with pure pursuit and the policy keeps authority where it
+      # is actually needed (near obstacles):
+      #   full      = policy steers always (behaviour before this change)
+      #   obstacles = pure pursuit in the open, policy near obstacles   <-- default
+      #   geometric = pure pursuit only (policy still runs, GRU stays warm, steering ignored)
+      # switch live, no rebuild:
+      #   ros2 param set /controller_server FollowPath.policy_authority geometric
+      #   ros2 param set /controller_server FollowPath.policy_authority full
+      # (the value must not be "off"/"none" -- the ros2 param CLI parses those as booleans)
+      policy_authority: "obstacles"
+      blend_clear_dist: 1.6        # m of clear corridor ahead -> pure pursuit has full authority
+      blend_obstacle_dist: 0.8     # m of clear corridor ahead -> policy has full authority
+      blend_half_width: 0.35       # m; corridor half-width the clearance is measured in -- a
+                                   # CORRIDOR not a cone, so hallway walls being passed don't
+                                   # hand the steering back to the policy
+      lookahead_dist: 0.7          # m; pure-pursuit lookahead (min turning radius is 0.31 m)
+      curve_slowdown: 0.4          # fraction of throttle_scale given up at full steering lock
+      rejoin_cross_track: 0.45     # m off the plan -> pure pursuit takes over to rejoin
+      max_cross_track: 1.2         # m off the plan for max_cross_track_sec -> fail the
+      max_cross_track_sec: 3.0     # controller so the BT replans / falls back to TEB (0 disables)
+      transform_path: True         # TF the pose into the PLAN's frame. The plan is in map, Nav2
+                                   # hands the pose in the local costmap's frame (odom), so
+                                   # without this every waypoint term carries AMCL's live
+                                   # map->odom correction and jerks on each AMCL update.
+      debug: True
+
+    # Fallback controller (see comment above controller_plugins). Same params as
+    # config/nav2_controller_teb.yaml's standalone TEB setup, just registered under a
+    # second controller_id here instead of being the only option. Runs at the shared
+    # controller_frequency (30 Hz, set for RL above) rather than TEB's own usual 10 Hz --
+    # acceptable since this is a last-resort fallback, not the tuned primary path.
+    FollowPathTEB:
+      plugin: teb_local_planner::TebLocalPlannerROS
+
+      teb_autosize: 1.0
+      dt_ref: 0.6
+      dt_hysteresis: 0.1
+      max_samples: 500
+      global_plan_overwrite_orientation: True
+      allow_init_with_backwards_motion: False
+      max_global_plan_lookahead_dist: 3.0
+      global_plan_viapoint_sep: 0.3
+      global_plan_prune_distance: 1.0
+      exact_arc_length: False
+      feasibility_check_no_poses: 5
+      publish_feedback: False
+
+      # Robot
+      max_vel_x: 0.4
+      max_vel_theta: 2.0
+      acc_lim_x: 2.5
+      acc_lim_theta: 3.2
+      min_turning_radius: 0.7
+      wheelbase: 0.213
+      footprint_model:
+        type: "circular"
+        radius: 0.05
+
+      # GoalTolerance
+      free_goal_vel: False
+
+      # Obstacles
+      min_obstacle_dist: 0.25
+      inflation_dist: 0.0
+      include_costmap_obstacles: True
+      costmap_obstacles_behind_robot_dist: 1.0
+      obstacle_poses_affected: 15
+
+      dynamic_obstacle_inflation_dist: 0.6
+      include_dynamic_obstacles: True
+
+      costmap_converter_plugin: "costmap_converter::CostmapToPolygonsDBSMCCH"
+      costmap_converter_spin_thread: True
+      costmap_converter_rate: 10
+
+      # Optimization
+      no_inner_iterations: 5
+      no_outer_iterations: 4
+      optimization_activate: True
+      optimization_verbose: False
+      penalty_epsilon: 0.1
+      obstacle_cost_exponent: 4.0
+      weight_max_vel_x: 0.5
+      weight_max_vel_theta: 0.5
+      weight_acc_lim_x: 0.5
+      weight_acc_lim_theta: 10.5
+      weight_kinematics_nh: 1000.0
+      weight_kinematics_forward_drive: 1.0
+      weight_kinematics_turning_radius: 1.0
+      weight_optimaltime: 1.0
+      weight_shortest_path: 0.0
+      weight_obstacle: 100.0
+      weight_inflation: 0.2
+      weight_dynamic_obstacle: 10.0
+      weight_dynamic_obstacle_inflation: 0.2
+      weight_viapoint: 50.0
+      weight_adapt_factor: 2.0
+
+      # Homotopy Class Planner
+      enable_homotopy_class_planning: True
+      enable_multithreading: True
+      max_number_classes: 4
+      selection_cost_hysteresis: 5.0
+      selection_prefer_initial_plan: 1.0
+      selection_obst_cost_scale: 1.0
+      selection_alternative_time_cost: True
+
+      roadmap_graph_no_samples: 15
+      roadmap_graph_area_width: 5.0
+      roadmap_graph_area_length_scale: 1.0
+      h_signature_prescaler: 0.5
+      h_signature_threshold: 0.1
+      obstacle_heading_threshold: 0.45
+      switching_blocking_period: 0.0
+      viapoints_all_candidates: True
+      delete_detours_backwards: True
+      max_ratio_detours_duration_best_duration: 3.0
+      visualize_hc_graph: False
+      visualize_with_time_as_z_axis_scale: 0.0
+
+      # Recovery
+      shrink_horizon_backup: True
+      shrink_horizon_min_duration: 10.0
+      oscillation_recovery: True
+      oscillation_v_eps: 0.1
+      oscillation_omega_eps: 0.1
+      oscillation_recovery_min_duration: 10.0
+      oscillation_filter_duration: 10.0
+
+controller_server_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
