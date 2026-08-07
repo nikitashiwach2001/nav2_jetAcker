@@ -1,0 +1,43 @@
+# Named navigation goals for scripts/send_goal.py -- no RViz needed.
+#
+#   python3 ~/ros2_ws/src/navigation/scripts/send_goal.py g1
+#   python3 ~/ros2_ws/src/navigation/scripts/send_goal.py --list
+#   python3 ~/ros2_ws/src/navigation/scripts/send_goal.py --save <name>   (saves robot's current pose)
+#
+# Coordinates are in the MAP frame of slam/maps/map_01 (314x258 px, res 0.05,
+# origin [-1.97, -5.85]). They were picked automatically from that .pgm: every point is
+# in genuinely-observed free space (white, not the gray unmapped area), reachable from
+# (0,0) by a flood fill, and at least 0.45 m clear of any wall/unmapped cell -- well
+# outside the robot's 0.13 m half-width. See config/goal_map.png for where they are.
+#
+# IMPORTANT: these are only valid for THIS map. Re-map (new .pgm) -> re-pick them.
+# No 'yaw' is stored on purpose: send_goal.py then aims from wherever the robot
+# currently is, and goal_point_relay.py replaces that heading if it plans a loopy path.
+goals:
+  g1:
+    x: 0.93
+    y: 1.95
+  g2:
+    x: 4.08
+    y: -0.25
+  g3:
+    x: 4.33
+    y: 2.10
+  g4:
+    x: 6.93
+    y: -0.45
+  g5:
+    x: 9.78
+    y: -1.0
+  g6:
+    x: 7.58
+    y: 3.20
+  g7:
+    x: 10.08
+    y: -3.10
+  g8:
+    x: 10.78
+    y: 4.10
+  g9:
+    x: 12.48
+    y: 3.25

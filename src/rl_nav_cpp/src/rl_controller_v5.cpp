@@ -174,23 +174,6 @@ public:
     // reaching full deflection in time and the robot got stuck. A plain EMA has no such
     // hard per-cycle ceiling.
     declareParam("steer_ema_alpha", 0.7);
-    // oscillation detector (supervisory safety layer, NOT a filter): if the commanded
-    // steering direction flips this many times within the window while actively driving
-    // forward, hand off to TEB rather than let the policy keep weaving indefinitely.
-    // Tune based on real behavior: a genuine winding path legitimately flips sign every
-    // 1-2 s, so these defaults require flips faster than that to trigger.
-    declareParam("oscillation_flip_count", 5);
-    declareParam("oscillation_window_sec", 4.0);
-    declareParam("oscillation_min_speed", 0.05);   // m/s; below this, don't count flips
-    // heading-divergence detector (supervisory safety layer): if the heading error to the
-    // target waypoint stays above this magnitude (rad) for this long while actively
-    // driving, hand off to TEB -- catches "confidently committing to the wrong direction
-    // and never correcting" (e.g. steer-sign mismatch), which the oscillation detector
-    // (needs sign flips) never sees. ~2.0 rad =~ 115 deg: past this the target is behind
-    // the robot, which briefly happens on legitimate sharp turns too, so this only fires
-    // if it STAYS this bad for heading_diverge_sec straight.
-    declareParam("heading_diverge_thresh", 2.0);
-    declareParam("heading_diverge_sec", 3.0);
 
     // ---- path-tracking layer (see the PATH TRACKING note at the top of this file) ----
     // "full"      = policy steers at all times (behaviour before 2026-07-28)
@@ -716,66 +699,13 @@ public:
       if (std::abs(d) < deadband) d = 0.0;
     }
 
-    // --- oscillation detector: sustained left-right steering direction flips while
-    // actively driving forward under the RL policy. This is NOT a frequency-domain noise
-    // problem (steer_ema_alpha already passes real <1 Hz turns through on purpose) -- it
-    // catches the case where the POLICY ITSELF keeps alternating its decision. No output
-    // filter can fix a wrong decision, so instead of trying to smooth this away, hand off
-    // to TEB (deterministic, no such failure mode) via the same BT fallback mechanism the
-    // stuck-detector uses. This is distinct from stuck-detection: a robot that's weaving
-    // but still net-moving forward never trips the (near-zero-motion) stuck detector above.
-    if (!reversing_ && !docking && !est &&
-        v > node_->get_parameter(prefix("oscillation_min_speed")).as_double()) {
-      double sign = (d > 0.02) ? 1.0 : (d < -0.02) ? -1.0 : 0.0;
-      if (sign != 0.0) {
-        if (last_steer_sign_ != 0.0 && sign != last_steer_sign_) {
-          flip_times_.push_back(now);
-        }
-        last_steer_sign_ = sign;
-      }
-      double window = node_->get_parameter(prefix("oscillation_window_sec")).as_double();
-      while (!flip_times_.empty() && (now - flip_times_.front()).seconds() > window) {
-        flip_times_.pop_front();
-      }
-      int flip_thresh = static_cast<int>(node_->get_parameter(prefix("oscillation_flip_count")).as_int());
-      if (static_cast<int>(flip_times_.size()) >= flip_thresh) {
-        flip_times_.clear();
-        last_steer_sign_ = 0.0;
-        fail("RL controller v5: sustained steering oscillation (" + std::to_string(flip_thresh) +
-             "+ direction flips in " + std::to_string(window) + " s) -> handing off to TEB");
-      }
-    } else {
-      // don't let a mode-transition edge (e.g. docking -> normal) count as a flip
-      last_steer_sign_ = 0.0;
-    }
-
-    // --- heading-divergence detector: sustained large heading error to the target
-    // waypoint that never shrinks, while actively driving forward. Distinct from the
-    // oscillation detector above (that needs sign FLIPS; this catches the opposite
-    // failure mode -- committing hard to one direction and never correcting, e.g. the
-    // path is clearly to one side and the robot just keeps heading its own current way).
-    // Automatically detecting and correcting a genuine steering-sign-convention mismatch
-    // is NOT safe to do at runtime (it's a fixed hardware/model property, not something
-    // that's "sometimes" wrong -- toggling it mid-episode would invert every subsequent
-    // decision). What IS safe: recognize "not correcting toward the target" as a
-    // controller failure regardless of root cause, and hand off to TEB, same as above.
-    if (!reversing_ && !docking && !est &&
-        v > node_->get_parameter(prefix("oscillation_min_speed")).as_double()) {
-      double thresh = node_->get_parameter(prefix("heading_diverge_thresh")).as_double();
-      if (std::abs(gangle) > thresh) {
-        if (!heading_bad_timing_) { heading_bad_timing_ = true; heading_bad_since_ = now; }
-        double diverge_sec = node_->get_parameter(prefix("heading_diverge_sec")).as_double();
-        if ((now - heading_bad_since_).seconds() > diverge_sec) {
-          heading_bad_timing_ = false;
-          fail("RL controller v5: heading error stuck at " + std::to_string(gangle) +
-               " rad for " + std::to_string(diverge_sec) + "+ s -> handing off to TEB");
-        }
-      } else {
-        heading_bad_timing_ = false;
-      }
-    } else {
-      heading_bad_timing_ = false;
-    }
+    // (An oscillation detector and a heading-divergence detector used to sit here.
+    // Both failed the FollowPath action -- which makes the BT run its blind 0.40 m
+    // BackUp recovery -- on mere weaving or a large-but-transient heading error, i.e.
+    // with nothing in front of the robot and the robot not actually stuck. Removed
+    // 2026-08-04: the reverses they caused were worse than what they were guarding
+    // against. The off-path detector below is kept -- it needs a genuinely large
+    // cross-track error sustained over time, not a momentary wobble.)
 
     // --- off-path detector: the rejoin logic above pulls the robot back to the plan, so a
     // cross-track error that stays large anyway means tracking has genuinely failed (plan the
@@ -872,9 +802,6 @@ private:
     have_settled_since_ = false;
     dock_reversing_ = false;
     was_docking_ = false;
-    flip_times_.clear();
-    last_steer_sign_ = 0.0;
-    heading_bad_timing_ = false;
     cross_bad_timing_ = false;
     path_idx_ = 0;
     fatal_ = false;
@@ -1200,10 +1127,6 @@ private:
   bool was_docking_{false};
   rclcpp::Time last_time_;
   bool have_last_time_{false};
-  std::deque<rclcpp::Time> flip_times_;
-  double last_steer_sign_{0.0};
-  bool heading_bad_timing_{false};
-  rclcpp::Time heading_bad_since_;
   bool cross_bad_timing_{false};
   rclcpp::Time cross_bad_since_;
   bool fatal_{false};

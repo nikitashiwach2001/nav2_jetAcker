@@ -20,10 +20,13 @@ def launch_setup(context):
         navigation_package_path = '/home/ubuntu/ros2_ws/src/navigation'
 
     rtabmap = LaunchConfiguration('rtabmap')
-    # 'amcl' (map_server+amcl, original) or 'slam_toolbox' (localization_slam_toolbox.launch.py,
-    # deserializes slam/maps/map_01_v2 -- see that file's header comment for why it's not
-    # lifecycle-managed). Switch back any time with localization_method:=amcl, no rebuild.
-    localization_method = LaunchConfiguration('localization_method', default='slam_toolbox').perform(context)
+    # 'amcl' (map_server+amcl, the original) or 'slam_toolbox'
+    # (localization_slam_toolbox.launch.py, deserializes slam/maps/map_01_v2 -- see that
+    # file's header for why it must be a standalone node, not a composable one).
+    # Back to amcl 2026-08-03 at the user's request. The slam_toolbox path is kept and
+    # still works (it published /map + map->odom fine); it is simply not the default.
+    # Select it any time with localization_method:=slam_toolbox -- no rebuild needed.
+    localization_method = LaunchConfiguration('localization_method', default='amcl').perform(context)
     namespace = LaunchConfiguration('namespace')
     use_namespace = LaunchConfiguration('use_namespace').perform(context)
     use_teb = LaunchConfiguration('use_teb', default='true').perform(context)

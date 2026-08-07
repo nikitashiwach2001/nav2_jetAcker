@@ -14,28 +14,66 @@ amcl:
     global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
-    laser_max_range: 10.0
+    # 10.0 -> 12.0: the A1's actual maximum range. In a space this large the longest beams
+    # are the most distinctive ones (they reach far walls rather than nearby pillars, which
+    # all look alike), so throwing away the 10-12 m band was discarding the most useful
+    # information for telling one part of the map from another. Costs nothing extra --
+    # these beams are already in the scan.
+    laser_max_range: 12.0
     laser_min_range: 0.2
     laser_model_type: "likelihood_field"
-    max_beams: 60
+    # 60 -> 120 (2026-08-04). This space is large and self-similar (rows of near-identical
+    # pillars, see config/goal_map.png), which is the worst case for scan matching: with
+    # few beams many distinct places produce almost the same likelihood, so the filter
+    # drifts to a look-alike spot. More beams per update make each match more distinctive.
+    # Costs CPU on every update -- if the Jetson starts missing control cycles, come back
+    # down towards 90. (Policy inference itself is only ~0.4 ms, so there is headroom.)
+    max_beams: 120
     max_particles: 3000
     min_particles: 500
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
-    resample_interval: 1
+    # Adaptive-MCL recovery. With both at 0.0 (the previous setting) AMCL never injects
+    # random particles, so once it loses the pose it stays lost -- no amount of driving
+    # brings it back, only a manual "2D Pose Estimate" or a restart. That is exactly the
+    # reported "localization kharab ho jati hai aur phir theek nahi hoti". AMCL compares a
+    # fast vs slow running average of how well the particles match the scan; when the fast
+    # one falls well below the slow one it scatters fresh particles so the filter can
+    # re-converge elsewhere. 0.1 / 0.001 are the values from AMCL's own documentation.
+    # Recovery only runs on an AMCL update, and updates only happen once the robot has
+    # moved update_min_d / update_min_a -- so the robot must be DRIVING for this to help.
+    # Trade-off: in a repetitive space the pose may occasionally jump to a look-alike spot
+    # rather than staying smoothly wrong -- still better than being permanently lost.
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
+    # 1 -> 2: resampling on every single update steadily kills particle diversity (the same
+    # few particles get copied over and over), so the filter commits to one hypothesis early.
+    # Where many places look alike, that early commitment is exactly how it locks onto the
+    # wrong one. Resampling every other update keeps alternative hypotheses alive longer.
+    resample_interval: 2
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
     sigma_hit: 0.2
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.2
-    update_min_d: 0.25
-    z_hit: 0.5
+    # How far the robot must move before AMCL runs an update (and therefore before it can
+    # correct drift or trigger the recovery above). Lowered 2026-08-04: 0.25 m / 0.2 rad
+    # let a quarter metre of odometry error accumulate uncorrected, and odometry here comes
+    # from rf2o laser matching with no wheel encoders to back it up, so that error is not
+    # small. Correcting roughly twice as often keeps the estimate tighter.
+    update_min_a: 0.1
+    update_min_d: 0.12
+    # Beam-model mixture weights (must sum to ~1). Were 0.5 / 0.5, i.e. "half of every scan
+    # is unexplained noise" -- that flattens the likelihood function, so a correct pose and a
+    # wrong one score almost the same. In a self-similar space (rows of near-identical
+    # pillars) that is the difference between converging and drifting to a look-alike spot.
+    # 0.8 / 0.15 sharpens the match while keeping enough z_rand to tolerate things that are
+    # NOT in the map (people, moved furniture). If localization becomes twitchy around
+    # unmapped obstacles, walk z_hit back toward 0.65 and z_rand up.
+    z_hit: 0.8
     z_max: 0.05
-    z_rand: 0.5
+    z_rand: 0.15
     z_short: 0.05
     scan_topic: scan
     # Was hardcoded to (0,0,0) -- AMCL always "believed" it started at map origin
@@ -415,10 +453,10 @@ collision_monitor:
       # v1 safety net, re-enabled: with the controller's e-stop now correctly oriented
       # (lidar_angle_offset fix) the robot stops 0.30 m short, so the freeze-on-contact
       # trap (points inside footprint -> all cmd_vel zeroed) should no longer be reachable.
-      # TEMPORARILY DISABLED 2026-08-03 as a diagnostic: nav2_container segfaults
-      # (exit -11) ~40 s after load, right when local_costmap activates and starts
-      # publishing published_footprint -- suspecting this approach polygon.
-      enabled: False
+      # (2026-08-03: briefly disabled to test whether this polygon caused the
+      # nav2_container segfault -- it did NOT, the crash persisted with it off, so it's
+      # restored here.)
+      enabled: True
     observation_sources: ["scan"]
     scan:
       type: "scan"
