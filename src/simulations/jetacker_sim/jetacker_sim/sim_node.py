@@ -88,7 +88,13 @@ class SimNode(Node):
         self.ray_steps = np.arange(self.range_min, self.range_max, self.resolution * 0.5)
         self.angle_increment = 2.0 * math.pi / self.num_samples
 
+        # 2026-08-18: nav2's collision_monitor now outputs to /controller/cmd_vel instead of
+        # /cmd_vel (the real driver hard-clamps /cmd_vel to 0.2 m/s -- see cmd_vel_out_topic
+        # in nav2_params.yaml). Subscribe to both so the sim works either way.
+        # OLD: self.cmd_sub = self.create_subscription(Twist, '/cmd_vel', self.on_cmd_vel, 10)
         self.cmd_sub = self.create_subscription(Twist, '/cmd_vel', self.on_cmd_vel, 10)
+        self.cmd_sub_ctrl = self.create_subscription(
+            Twist, '/controller/cmd_vel', self.on_cmd_vel, 10)
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.scan_raw_pub = self.create_publisher(LaserScan, '/scan_raw', qos_profile_sensor_data)
         self.scan_pub = self.create_publisher(LaserScan, '/scan', qos_profile_sensor_data)

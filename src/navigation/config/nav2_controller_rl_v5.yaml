@@ -62,7 +62,10 @@ controller_server:
       # channels near-dead. velocity_smoother max_velocity[0] raised 0.36 -> 0.75 to match
       # (MUST stay >= this value, see the note below).
       # OLD: throttle_scale: 0.35
-      throttle_scale: 0.70
+      # TRIED 0.70 -- too fast on the real robot once the driver's hidden 0.2 m/s clamp was
+      # lifted (see cmd_vel_out_topic in nav2_params.yaml). Backed off to 0.50.
+      # OLD: throttle_scale: 0.70
+      throttle_scale: 0.50
       # (original comment for the 0.35 value:)
       #                            # m/s at action=1 -- raised 0.25->0.35 (2026-07-30);
                                    # velocity_smoother's max_velocity raised to 0.36 to match

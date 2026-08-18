@@ -430,14 +430,26 @@ velocity_smoother:
     # the smoother clips linear.x but passes angular.z through (scale_velocities: False), so
     # any clipping inflates the executed curvature.
     # OLD: max_velocity: [0.36, 0.0, 1.0]
-    max_velocity: [0.75, 0.0, 1.0]
-    min_velocity: [-0.36, 0.0, -1.0]
+    # 2026-08-18: angular limits raised with throttle_scale 0.70. For Ackermann, angular.z is
+    # NOT independent -- it is v*tan(steer)/wheelbase. With scale_velocities: False the
+    # smoother clips linear and angular separately, so an angular cap below what the commanded
+    # curvature needs silently distorts the executed steering: at 0.70 m/s and full lock the
+    # controller asks for 0.70*tan(0.60)/0.213 = 2.25 rad/s, and the old 1.0 cap turned a
+    # 0.600 rad (34 deg) command into 0.295 rad (17 deg). 2.4 sits just above that worst case
+    # so the angular limit never binds. Accel 1.8 -> 4.0: reaching 2.25 rad/s now takes
+    # ~0.56 s instead of 1.25 s.
+    # OLD: max_velocity: [0.75, 0.0, 1.0]
+    max_velocity: [0.75, 0.0, 2.4]
+    # OLD: min_velocity: [-0.36, 0.0, -1.0]
+    min_velocity: [-0.36, 0.0, -2.4]
     # angular accel tightened 3.2 -> 1.8 rad/s^2 (2026-07-28): second-stage smoothing for
     # left-right weave during normal RL-driven navigation, complementing each RL
     # controller's own steer_ema_alpha filter (this acts on angular.z downstream, after
     # the controller, at the shared velocity_smoother -- affects all of v1-v5 and TEB/DWB).
-    max_accel: [2.5, 0.0, 1.8]
-    max_decel: [-2.5, 0.0, -1.8]
+    # OLD: max_accel: [2.5, 0.0, 1.8]
+    max_accel: [2.5, 0.0, 4.0]
+    # OLD: max_decel: [-2.5, 0.0, -1.8]
+    max_decel: [-2.5, 0.0, -4.0]
     odom_topic: odom
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -455,7 +467,20 @@ collision_monitor:
     base_frame_id: "base_footprint"
     odom_frame_id: "odom"
     cmd_vel_in_topic: "cmd_vel_smoothed"
-    cmd_vel_out_topic: "cmd_vel"
+    # 2026-08-18 THE speed cap. The hardware driver's odom_publisher node subscribes to
+    # /cmd_vel with app_cmd_vel_callback (odom_publisher_node.py:173-186), which HARD CLAMPS
+    # linear.x to 0.2 m/s and angular.z to 0.5 rad/s before forwarding to cmd_vel_callback.
+    # That callback is a phone-app safety limit -- nav2 was only going through it because
+    # nav2's default output topic happens to be the same one. Every throttle_scale change
+    # ever made (0.25 -> 0.35 -> 0.70) was silently cut to 0.2 m/s at this point.
+    # /controller/cmd_vel is this robot's normal programmatic-control topic (joystick, voice
+    # control and every example node publish there); it reaches the SAME cmd_vel_callback,
+    # just without the clamps. The app clamp stays intact for the app.
+    # Absolute path on purpose: the driver subscribes to an absolute /controller/cmd_vel, so
+    # a relative name would break if this stack were ever pushed into a namespace.
+    # REVERT: put this back to "cmd_vel" and the 0.2 m/s cap returns.
+    # OLD: cmd_vel_out_topic: "cmd_vel"
+    cmd_vel_out_topic: "/controller/cmd_vel"
     transform_tolerance: 0.2
     source_timeout: 1.0      # lidar silent for 1s -> treat as unsafe and stop
     base_shift_correction: True
@@ -480,8 +505,17 @@ collision_monitor:
       # -> 0.315 m margin. Do not go below 0.8; at 0.6 the margin nearly vanishes.
       # estop_distance (0.30 m, in nav2_controller_rl_v5.yaml) is a separate hard layer and
       # still applies unchanged.
-      # OLD: time_before_collision: 1.2
-      time_before_collision: 0.8
+      # REVERTED 2026-08-18 (same day) back to 1.2 on the user's call: dead-end escapes were
+      # taking too many attempts and it was getting stuck even in easy ones, so the more
+      # conservative braking horizon was preferred.
+      # NOTE for whoever revisits this: tbc also sets the REVERSE veto zone
+      # (reverse_speed 0.10 * tbc + footprint rear 0.18), so 1.2 gives 0.30 m vs 0.26 m at
+      # 0.8 -- i.e. 1.2 makes backing out of a dead end slightly HARDER, not easier. If the
+      # many-attempts problem persists the cause is far more likely the controller's
+      # first-attempt give-up rule (travelled < 0.10 && !front_open -> fail "boxed in")
+      # in rl_controller_v5.cpp, not this parameter.
+      # TRIED 0.8 (1.5x speed near obstacles), reverted:
+      time_before_collision: 1.2
       # 2026-08-18: 0.1 -> 0.05. collision_monitor quantizes predicted collision time to this
       # step, so the scaled output velocity moves in jumps (0.088 m/s at 0.1 s / 0.70 m/s;
       # 0.044 m/s at 0.05 s). It sits AFTER velocity_smoother in the chain

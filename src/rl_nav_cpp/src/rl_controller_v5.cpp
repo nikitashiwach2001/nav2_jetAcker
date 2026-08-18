@@ -636,18 +636,26 @@ public:
         {
           float rear_left = rearSideClearance(true);
           float rear_right = rearSideClearance(false);
-          float front_left = sideClearance(true);
-          float front_right = sideClearance(false);
+          float front_left = frontSideOpenness(true);
+          float front_right = frontSideOpenness(false);
           const float SIDE_MARGIN = 0.15f;  // m; how much clearer one side must be to override the next tie-break
           const char * why;
-          if (rear_right > rear_left + SIDE_MARGIN) {
+          // Attempt 2 of a streak FORCES the opposite direction. Recomputing from the sensors
+          // every attempt is what made the robot repeat an identical failed maneuver: the
+          // geometry has barely changed after a short shuffle, so the same side wins again and
+          // nothing remembers that it was already tried. Flipping guarantees both geometries
+          // are covered within two attempts instead of waiting for a near-tie to tip.
+          if (failed_reverses_ == 1) {
+            reverse_dir_ = -reverse_dir_;
+            why = "flip";
+          } else if (rear_right > rear_left + SIDE_MARGIN) {
             reverse_dir_ = -1.0;   // rear-right is the open escape -> yaw left while backing
             why = "rear";
           } else if (rear_left > rear_right + SIDE_MARGIN) {
             reverse_dir_ = 1.0;    // rear-left is the open escape -> yaw right while backing
             why = "rear";
           } else if (front_left > front_right + SIDE_MARGIN) {
-            reverse_dir_ = -1.0;   // rear a tie -> prefer the side the nose will sweep into
+            reverse_dir_ = -1.0;   // rear a tie -> yaw toward the side the nose will sweep into
             why = "front";
           } else if (front_right > front_left + SIDE_MARGIN) {
             reverse_dir_ = 1.0;
@@ -658,9 +666,9 @@ public:
           }
           RCLCPP_INFO(
             logger_,
-            "reverse dir %s by %s (rear L/R %.2f/%.2f, front L/R %.2f/%.2f)",
+            "reverse dir %s by %s (attempt %d; rear L/R %.2f/%.2f, front-open L/R %.2f/%.2f)",
             reverse_dir_ < 0.0 ? "yaw-left/back-right" : "yaw-right/back-left",
-            why, rear_left, rear_right, front_left, front_right);
+            why, failed_reverses_ + 1, rear_left, rear_right, front_left, front_right);
         }
         RCLCPP_WARN(logger_, "STUCK (%s) -> reversing out", est_stuck ? "wall in forward arc" : "pushing but not moving");
       }
@@ -743,6 +751,14 @@ public:
         // up a real ~0.2-0.3 m each time and still oscillates, so distance alone can't be
         // the only signal. Only sustained forward progress (checked above) clears this.
         ++failed_reverses_;
+        // DO NOT remove the `travelled < 0.10 && !front_open` clause below. Tried that on
+        // 2026-08-18 (reasoning: it fires on the very first attempt and so prevents the
+        // 3-attempt escalation from ever running) and the robot stopped dead at a wall.
+        // Reason: failed_reverses_ is reset to 0 after RESUME_SETTLE_SEC (5 s) of settled
+        // motion, and the small shuffle between attempts is enough to trigger that reset --
+        // so `failed_reverses_ >= 3` is frequently never reached and the controller loops
+        // inside itself forever, never throwing, so the BT never gets to replan or fall back
+        // to TEB. This clause is the only reliable escape hatch out of that loop.
         if (failed_reverses_ >= 3 || (travelled < 0.10 && !front_open)) {
           int streak = failed_reverses_;
           failed_reverses_ = 0;
@@ -1045,6 +1061,34 @@ private:
   // (180..270 deg, REAR-RIGHT). Only usable since the lidar was remounted high enough to see
   // 360 deg -- on the old low mount the robot body occluded this whole arc and it always
   // returned LIDAR_CAP.
+  // How open is the side the NOSE would swing into, measured where the robot would actually
+  // go if it turned. sideClearance() takes the MIN over a full 90-deg quadrant (rays 0..45 /
+  // 135..179), and a blocker sitting dead ahead falls inside BOTH quadrants -- so with a wall
+  // in front it returns near-identical values for left and right no matter which side is
+  // open, the comparison ties, and the direction silently falls through to the gangle sign.
+  // gangle hovers near zero while the robot shuffles, so its sign flips arbitrarily: that is
+  // the "it reverses the wrong way 4-5 times and then suddenly changes" behaviour.
+  //
+  // This looks at a narrow FORWARD-BIASED sector instead -- bearings 20..70 deg (rays 10..35)
+  // on the left, 290..340 deg (rays 145..170) on the right. That excludes the dead-ahead
+  // blocker AND the pure-side walls being passed at 90 deg. MEAN, not min, so one stray ray
+  // cannot veto an otherwise open side.
+  float frontSideOpenness(bool left) const
+  {
+    const std::vector<float> & fr = frameAtOffset(0);
+    int lo = left ? 10 : 145;
+    int hi = left ? 35 : 170;
+    double sum = 0.0;
+    int n = 0;
+    for (int i = lo; i <= hi; ++i) {
+      float r = fr[i] * LIDAR_CAP;
+      if (r < 0.05f) continue;
+      sum += r;
+      ++n;
+    }
+    return n ? static_cast<float>(sum / n) : LIDAR_CAP;
+  }
+
   float rearSideClearance(bool left) const
   {
     const std::vector<float> & fr = frameAtOffset(0);
