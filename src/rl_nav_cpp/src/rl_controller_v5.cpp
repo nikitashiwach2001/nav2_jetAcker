@@ -101,6 +101,9 @@ constexpr float TEMPORAL_EMA = 0.8f;
 constexpr float STEP_DT = 0.0333333f;           // 30 Hz control (decimation 4 x 1/120)
 constexpr double RESUME_SETTLE_SEC = 5.0;       // sustained (not momentary) motion needed
                                                  // to clear the boxed-in failure streak
+constexpr double REV_PROGRESS_EPS = 0.03;       // m the robot must gain during a reverse to
+                                                 // count as still making ground; below this
+                                                 // for reverse_stall_sec means rear contact
 
 // action scalings (Ackermann)
 // NOTE: throttle scale is the `throttle_scale` parameter now. It MUST stay <= the velocity
@@ -144,6 +147,8 @@ public:
     declareParam("goal_change_thresh", 0.5);     // m endpoint move that counts as a new goal -> reset GRU
     declareParam("lidar_angle_offset", 0.0);     // rad; bearing of training ray 0 in the /scan frame
     declareParam("lidar_ccw", true);             // increasing ray index = CCW (REP-103)
+    declareParam("lidar_min_range", 0.22);       // m; closer returns are the robot's own
+                                                  // structure -> discarded (see sampleScan)
     // empirical knob: if the robot consistently, confidently steers the WRONG way (not
     // oscillating -- committing hard to one direction and never correcting, e.g. path is
     // clearly to one side and the robot just keeps heading its own current way), flip this
@@ -159,7 +164,22 @@ public:
     declareParam("reverse_stall_sec", 0.5);      // s; no real motion this long while reversing
                                                  // -> rear contact likely, stop grinding (was 0.8)
     declareParam("reverse_clear", 0.55);         // m; stop reversing once the corridor ahead is clear past this
-    declareParam("reverse_rear_stop", 0.22);     // m; rear-arc ray closer than this stops the reverse
+    declareParam("reverse_rear_stop", 0.22);
+    declareParam("reverse_half_width", 0.20);    // m; rear corridor half-width used by
+                                                  // rearCorridorMin (robot half-width 0.13
+                                                  // + margin). Wider = more cautious.     // m; rear-arc ray closer than this stops the reverse
+    // How hard and how far a reverse escape turns. These two decide the heading change the
+    // manoeuvre buys: heading = min_travel / (wheelbase / tan(steer)). Defaults give ~65 deg
+    // on the first attempt, ~92 on the second, ~120 on the third -- previously the first
+    // attempt was only 17 deg, which is why bypassing an unmapped obstacle took 4-5 shuffles.
+    // Live-tunable, no rebuild:
+    //   ros2 param set /controller_server FollowPath.reverse_min_travel 0.25
+    declareParam("reverse_min_travel", 0.35);    // m the first attempt must back up
+    declareParam("reverse_min_travel_step", 0.15);  // m added per consecutive failed attempt
+    declareParam("reverse_steer", 0.60);         // rad; first-attempt steer (0.60 = full lock)
+    declareParam("reverse_steer_step", 0.0);     // rad added per failed attempt (0.60 is already
+                                                  // the mechanical max, so this only bites if
+                                                  // reverse_steer is lowered)
     declareParam("throttle_scale", 0.25);        // m/s at action=1; keep <= velocity smoother max
     declareParam("dock_dist", 1.0);              // m; within this of the path end -> docking mode (0 disables)
     declareParam("dock_speed", 0.12);            // m/s; docking approach speed cap
@@ -188,6 +208,17 @@ public:
                                                  // (a CORRIDOR, not a cone: walls being passed in a
                                                  // narrow hallway must not hand control to the policy)
     declareParam("lookahead_dist", 0.7);         // m; pure-pursuit lookahead along the plan
+    // Speed-adaptive lookahead (added 2026-08-18 with throttle_scale 0.35 -> 0.70).
+    // A FIXED lookahead is only correct at one speed: 0.7 m is 2.0 s of preview at 0.35 m/s
+    // but only 1.0 s at 0.70 m/s, and pure pursuit starts oscillating once the preview gets
+    // short (it corrects for a target it reaches before the correction has taken effect).
+    // lookahead = clamp(|current speed| * lookahead_time, lookahead_min, lookahead_max),
+    // using the MEASURED odom speed -- deriving it from v_pp would be circular, since
+    // lookahead -> d_pp -> v_pp.
+    // Set lookahead_time: 0.0 to disable and go back to the fixed lookahead_dist above.
+    declareParam("lookahead_time", 2.0);         // s of preview to hold at any speed (0 = off)
+    declareParam("lookahead_min", 0.5);          // m; floor (min turning radius is 0.31 m)
+    declareParam("lookahead_max", 2.0);          // m; ceiling, stops it running off long straights
     declareParam("curve_slowdown", 0.4);         // fraction of throttle_scale given up at full lock
     declareParam("rejoin_cross_track", 0.45);    // m off the plan -> pure pursuit takes the steering
                                                  // back to rejoin (obstacle authority still wins)
@@ -428,7 +459,14 @@ public:
     double w_policy = 1.0;                  // 1 = policy steers, 0 = pure pursuit steers
     float clearance = LIDAR_CAP;
     if (proj.valid && authority != "full") {
+      // lookahead_dist stays live as the FALLBACK (used when lookahead_time is 0):
       double lookahead = std::max(node_->get_parameter(prefix("lookahead_dist")).as_double(), 0.05);
+      double la_time = node_->get_parameter(prefix("lookahead_time")).as_double();
+      if (la_time > 0.0) {
+        lookahead = clampf(std::abs(velocity.linear.x) * la_time,
+                           node_->get_parameter(prefix("lookahead_min")).as_double(),
+                           node_->get_parameter(prefix("lookahead_max")).as_double());
+      }
       Vec2 tgt = pathPointAt(proj.s + lookahead);
       double tang = std::atan2(tgt.y - robot.y, tgt.x - robot.x);
       double alpha = std::atan2(std::sin(tang - ryaw), std::cos(tang - ryaw));
@@ -458,8 +496,18 @@ public:
           w_policy = 0.0;
         }
       }
-      v = w_policy * v + (1.0 - w_policy) * v_pp;
+      // STEERING is blended, SPEED is not (changed 2026-08-08). Blending both meant that
+      // widening the steering handover (blend_clear_dist 1.6 -> 2.5, so avoidance starts
+      // earlier) also dragged the policy's cautious speed in from 2.5 m out. In a space
+      // this cluttered the corridor is under 2.5 m most of the time, so the robot ended up
+      // creeping almost everywhere -- a large, unintended slowdown.
+      // Taking the FASTER of the two keeps early steering avoidance without the creep:
+      // pure pursuit's speed (throttle_scale, eased only for curvature) sets the pace, and
+      // the policy can still speed things up if it wants to. Slowing down for obstacles is
+      // not lost -- the corridor e-stop (estop_distance) and the collision monitor are
+      // separate layers and both still apply.
       d = w_policy * d + (1.0 - w_policy) * d_pp;
+      v = std::max(v, v_pp);
     }
 
     // --- terminal docking ---
@@ -554,6 +602,9 @@ public:
         reversing_ = true;
         reverse_start_ = robot;
         reverse_begin_ = now;
+        // progress watchdog for the reverse (see rev_stalled below)
+        rev_progress_pos_ = robot;
+        rev_progress_time_ = now;
         // Decide the turn direction ONCE, here, and hold it for the whole maneuver.
         // gangle is recomputed every cycle from the live heading error, and while backing
         // up the robot's own yaw is changing (that's the point) -- if gangle happens to
@@ -567,17 +618,49 @@ public:
         // the other) -- this repeatedly re-attempts the SAME blocked direction and never
         // makes progress. Only fall back to the goal-oriented choice when both sides are
         // roughly equally clear (no strong physical reason to prefer either).
+        // The clearance that actually decides a REVERSE is the REAR clearance -- the rear is
+        // what hits something while backing up. The front quadrants still matter, but only
+        // secondarily: the nose sweeps the OPPOSITE way to the rear on an Ackermann reverse.
+        // Backing at reverse_steer with v<0 (yaw rate = v*tan(d)/L):
+        //   reverse_dir_ = -1  -> heading yaws LEFT,  body backs into the REAR-RIGHT, nose sweeps FRONT-LEFT
+        //   reverse_dir_ = +1  -> heading yaws RIGHT, body backs into the REAR-LEFT,  nose sweeps FRONT-RIGHT
+        // so each candidate direction is scored by the tighter of the two arcs it sweeps.
+        // Before the 360-deg lidar remount only the front quadrants were visible, so this
+        // used sideClearance() alone -- which measures where the robot is NOT going during a
+        // reverse, and happily picked the direction with a wall behind it.
+        // Priority is REAR first, front only as a tie-breaker. Combining them (e.g. scoring a
+        // direction by min(rear, front)) does NOT work: a reverse is triggered precisely
+        // because the front is blocked, so the front term is small on BOTH sides and clamps
+        // both scores to the same value, hiding the rear difference completely and dropping
+        // through to the goal-oriented fallback -- i.e. back to guessing.
         {
-          float left_clear = sideClearance(true);
-          float right_clear = sideClearance(false);
-          const float SIDE_MARGIN = 0.15f;  // m; how much clearer one side must be to override goal preference
-          if (left_clear > right_clear + SIDE_MARGIN) {
-            reverse_dir_ = -1.0;   // left is clearly more open -> turn left regardless of goal side
-          } else if (right_clear > left_clear + SIDE_MARGIN) {
-            reverse_dir_ = 1.0;    // right is clearly more open -> turn right regardless of goal side
+          float rear_left = rearSideClearance(true);
+          float rear_right = rearSideClearance(false);
+          float front_left = sideClearance(true);
+          float front_right = sideClearance(false);
+          const float SIDE_MARGIN = 0.15f;  // m; how much clearer one side must be to override the next tie-break
+          const char * why;
+          if (rear_right > rear_left + SIDE_MARGIN) {
+            reverse_dir_ = -1.0;   // rear-right is the open escape -> yaw left while backing
+            why = "rear";
+          } else if (rear_left > rear_right + SIDE_MARGIN) {
+            reverse_dir_ = 1.0;    // rear-left is the open escape -> yaw right while backing
+            why = "rear";
+          } else if (front_left > front_right + SIDE_MARGIN) {
+            reverse_dir_ = -1.0;   // rear a tie -> prefer the side the nose will sweep into
+            why = "front";
+          } else if (front_right > front_left + SIDE_MARGIN) {
+            reverse_dir_ = 1.0;
+            why = "front";
           } else {
-            reverse_dir_ = (gangle > 0.0) ? -1.0 : 1.0;   // similarly clear -> goal-oriented as before
+            reverse_dir_ = (gangle > 0.0) ? -1.0 : 1.0;   // all square -> goal-oriented as before
+            why = "goal";
           }
+          RCLCPP_INFO(
+            logger_,
+            "reverse dir %s by %s (rear L/R %.2f/%.2f, front L/R %.2f/%.2f)",
+            reverse_dir_ < 0.0 ? "yaw-left/back-right" : "yaw-right/back-left",
+            why, rear_left, rear_right, front_left, front_right);
         }
         RCLCPP_WARN(logger_, "STUCK (%s) -> reversing out", est_stuck ? "wall in forward arc" : "pushing but not moving");
       }
@@ -602,21 +685,49 @@ public:
       // ONLY affects the "front looks clear, safe to turn" exit path -- rear_blocked and
       // rev_stalled (contact detection) below are fully independent and still cut the
       // reverse short immediately (within reverse_stall_sec) regardless of this target.
-      double min_travel = std::min(rev_dist, 0.15 + failed_reverses_ * 0.15);
+      // How far this attempt must back up before the "front is clear, safe to turn" exit may
+      // fire. This is what sets how much the robot actually ROTATES, because the reverse is
+      // driven at a fixed steer angle: heading change = arc_length / turning_radius.
+      // It used to start at 0.15 m which, at the old 0.40 rad steer, is only 17 deg -- far
+      // too little to get past anything, so the robot drove forward, met the same obstacle
+      // and shuffled again; four or five rounds before the escalation had turned it enough.
+      // Starting at 0.35 m with full lock gives ~65 deg on the FIRST attempt (see
+      // reverse_steer below), which is roughly what the old third attempt achieved.
+      double mt0 = node_->get_parameter(prefix("reverse_min_travel")).as_double();
+      double mt_step = node_->get_parameter(prefix("reverse_min_travel_step")).as_double();
+      double min_travel = std::min(rev_dist, mt0 + failed_reverses_ * mt_step);
       double clear_x = node_->get_parameter(prefix("reverse_clear")).as_double();
       double half_w = node_->get_parameter(prefix("estop_half_width")).as_double();
       bool clear_to_turn = travelled >= min_travel && frontCorridorMin(half_w) > clear_x;
       bool done = clear_to_turn || travelled >= rev_dist;
       bool rear_blocked = rear_min < rear_stop;
-      // contact detector: the rear arc is PHYSICALLY blind (own structure blocks the
-      // lidar), so touching an obstacle behind is only visible as "commanding reverse
-      // but not moving". Bail fast instead of grinding against it (was 3.0 s).
+      // Contact detector. The rear arc is PHYSICALLY blind (the robot's own structure
+      // occludes rays 63..117, so rearArcMin() always returns LIDAR_CAP and rear_blocked
+      // above never fires) -- hitting something behind is only observable as "commanding
+      // reverse but not moving".
+      //
+      // This used to also require `travelled < 0.05`, i.e. it only ever fired if the robot
+      // never left the spot it started reversing from. Back up 0.3 m cleanly and THEN hit
+      // something and travelled is already 0.3, so the test was false and the reverse kept
+      // being commanded -- wheels grinding against the obstacle until the blunt `timed_out`
+      // below finally cut in at 3*reverse_dist/reverse_speed = 24 s. That is the "robot
+      // keeps going back and back after it collides" behaviour.
+      //
+      // Now it watches for a STALL AT ANY POINT: rev_progress_* record the last place the
+      // robot actually made ground, and if it fails to advance REV_PROGRESS_EPS for
+      // stall_sec from there, the reverse is cut immediately -- whether that happens at the
+      // very start or half a metre in.
       double stall_sec = node_->get_parameter(prefix("reverse_stall_sec")).as_double();
-      bool rev_stalled = elapsed > stall_sec &&
-                         std::abs(velocity.linear.x) < 0.02 && travelled < 0.05;
+      if (norm2({robot.x - rev_progress_pos_.x, robot.y - rev_progress_pos_.y})
+            > REV_PROGRESS_EPS) {
+        rev_progress_pos_ = robot;
+        rev_progress_time_ = now;
+      }
+      double stuck_for = (now - rev_progress_time_).seconds();
+      bool rev_stalled = stuck_for > stall_sec && std::abs(velocity.linear.x) < 0.02;
       if (rev_stalled) {
-        RCLCPP_WARN(logger_, "reverse produced no motion for %.1f s -> rear contact "
-                    "likely, stopping reverse", elapsed);
+        RCLCPP_WARN(logger_, "reverse made no ground for %.1f s after %.2f m -> rear "
+                    "contact likely, stopping reverse", stuck_for, travelled);
       }
       bool timed_out = elapsed > 3.0 * rev_dist / std::max(rev_speed, 0.01) || rev_stalled;
 
@@ -668,7 +779,15 @@ public:
         // escaping at an angle like a 3-point car park. Escalate the steer angle with each
         // consecutive failed attempt (failed_reverses_, reset once a reverse makes real
         // progress) so every retry turns sharper than the last.
-        double reverse_steer = std::min(STEER_SCALE, 0.40 + failed_reverses_ * 0.10);
+        // Full lock from the FIRST attempt (was 0.40 rad ramping by 0.10). Steering angle
+        // sets the turning radius (R = wheelbase / tan(steer)), so it decides how much
+        // heading is bought per metre reversed: 0.40 rad -> R 0.50 m, 0.60 rad -> R 0.31 m.
+        // Ramping up from 0.40 meant the first, most common attempt was also the weakest one.
+        // 0.60 is STEER_SCALE (the mechanical limit), so the step below only matters if
+        // reverse_steer is lowered from the default.
+        double st0 = node_->get_parameter(prefix("reverse_steer")).as_double();
+        double st_step = node_->get_parameter(prefix("reverse_steer_step")).as_double();
+        double reverse_steer = std::min(STEER_SCALE, st0 + failed_reverses_ * st_step);
         // use the direction locked in when this reverse started (reverse_dir_), NOT a
         // fresh gangle sign every frame -- see the comment where reverse_dir_ is set.
         d = reverse_dir_ * reverse_steer;
@@ -866,13 +985,42 @@ private:
   // least catches diagonal-rear returns that the raw scan does see.
   float rearArcMin() const
   {
+    return rearCorridorMin(
+      node_->get_parameter(prefix("reverse_half_width")).as_double());
+  }
+
+  // Mirror of frontCorridorMin for the rear half-plane: min BACKWARD distance of any return
+  // whose lateral offset is inside the robot's swept width.
+  //
+  // This replaced a raw +/-54 deg CONE (rays 63..117, min range over the whole wedge). The
+  // front check was moved off a cone long ago for exactly the reason in frontCorridorMin's
+  // comment -- a return off to the side is not in the way -- but the rear kept the cone
+  // because the rear arc was physically blind, so it always returned LIDAR_CAP and nothing
+  // depended on it. With the lidar remounted on top (360 deg) the cone became live, and now
+  // anything within reverse_rear_stop ANYWHERE in that 108 deg wedge aborts the reverse on
+  // its first cycle -- including obstacles well off to the rear-left/right that the robot
+  // would back straight past. Combined with the give-up rule (travelled < 0.10 m and the
+  // front still blocked -> fail immediately), a person in front plus something offset behind
+  // deadlocks the robot even though there is a clear escape.
+  //
+  // Caveat: the reverse actually follows an ARC (it backs at reverse_steer, radius ~0.31 m at
+  // full lock), so a straight corridor is still an approximation -- it is simply a much
+  // better one than a wedge, and matches what the front side already does.
+  float rearCorridorMin(double half_width) const
+  {
     const std::vector<float> & fr = frameAtOffset(0);
-    float rear_min = LIDAR_CAP;
-    for (int i = 63; i <= 117; ++i) {
+    float best = LIDAR_CAP;
+    for (int i = 0; i < N_RAYS; ++i) {
+      double b = 2.0 * M_PI * i / N_RAYS;          // ray bearing, CCW from +X
+      double cb = std::cos(b);
+      if (cb >= 0.0) continue;                     // forward half-plane
       float r = fr[i] * LIDAR_CAP;
-      if (r >= 0.05f) rear_min = std::min(rear_min, r);
+      if (r < 0.05f) continue;                     // below lidar range_min -> spurious zero
+      if (std::abs(r * std::sin(b)) <= half_width) {
+        best = std::min(best, static_cast<float>(r * -cb));   // -cb: backward distance
+      }
     }
-    return rear_min;
+    return best;
   }
 
   // min range in the front-left (0..90 deg CCW) or front-right (270..360 deg, i.e. rays
@@ -884,6 +1032,25 @@ private:
     float best = LIDAR_CAP;
     int lo = left ? 0 : 135;
     int hi = left ? 45 : 179;
+    for (int i = lo; i <= hi; ++i) {
+      float r = fr[i] * LIDAR_CAP;
+      if (r < 0.05f) continue;
+      best = std::min(best, r);
+    }
+    return best;
+  }
+
+  // Rear equivalent of sideClearance(). Ray i sits at bearing 2*i deg CCW from robot +X, so
+  // the two rear quadrants are rays 45..90 (90..180 deg, REAR-LEFT) and rays 90..135
+  // (180..270 deg, REAR-RIGHT). Only usable since the lidar was remounted high enough to see
+  // 360 deg -- on the old low mount the robot body occluded this whole arc and it always
+  // returned LIDAR_CAP.
+  float rearSideClearance(bool left) const
+  {
+    const std::vector<float> & fr = frameAtOffset(0);
+    float best = LIDAR_CAP;
+    int lo = left ? 45 : 90;
+    int hi = left ? 90 : 135;
     for (int i = lo; i <= hi; ++i) {
       float r = fr[i] * LIDAR_CAP;
       if (r < 0.05f) continue;
@@ -906,6 +1073,18 @@ private:
 
     double offset = node_->get_parameter(prefix("lidar_angle_offset")).as_double();
     double dir = node_->get_parameter(prefix("lidar_ccw")).as_bool() ? 1.0 : -1.0;
+    // Anything closer than this is treated as "no return" -- it is the robot seeing ITSELF.
+    // After the lidar was remounted on top (2026-08-14) a fixed structure sits 0.18 m away
+    // in the forward corridor: 30 deg wide, standard deviation 0.000 m across consecutive
+    // scans, i.e. rigidly attached. Left in, frontCorridorMin() reports 0.18 m forever, the
+    // corridor e-stop (estop_distance 0.30) latches permanently and the robot never drives
+    // -- it just e-stops and then reverse-recovers for no reason.
+    // Safe to discard: a real obstacle trips the 0.30 m e-stop long before it could reach
+    // 0.22 m, and the collision monitor reads /scan_raw independently and is unaffected.
+    // /scan (AMCL + costmaps) was already protected -- lidar_filters_config_a1.yaml has
+    // lower_threshold 0.2 -- only this controller reads the raw scan.
+    // Raise if more of the robot appears; lower to 0.0 to disable.
+    double min_range = node_->get_parameter(prefix("lidar_min_range")).as_double();
     int n = static_cast<int>(s->ranges.size());
 
     for (int i = 0; i < N_RAYS; ++i) {
@@ -914,7 +1093,7 @@ private:
       int idx = static_cast<int>(std::lround((ang - s->angle_min) / s->angle_increment));
       idx = ((idx % n) + n) % n;
       float r = s->ranges[idx];
-      out[i] = (!std::isfinite(r) || r >= LIDAR_CAP) ? 1.0f
+      out[i] = (!std::isfinite(r) || r >= LIDAR_CAP || r < min_range) ? 1.0f
                : clampf(r / LIDAR_CAP, 0.0f, 1.0f);
     }
     return out;
@@ -1119,6 +1298,8 @@ private:
   double reverse_dir_{1.0};   // decided once when the reverse starts, held for its duration
   Vec2 reverse_start_{0, 0};
   rclcpp::Time reverse_begin_;
+  Vec2 rev_progress_pos_{0, 0};   // last spot the reverse actually gained ground from
+  rclcpp::Time rev_progress_time_;
   int failed_reverses_{0};
   rclcpp::Time settled_since_;
   bool have_settled_since_{false};

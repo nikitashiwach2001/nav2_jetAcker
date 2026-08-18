@@ -56,7 +56,15 @@ controller_server:
       reverse_rear_stop: 0.22      # m; rear bumper is ~0.16 m behind the lidar -- 0.30 was so
                                    # conservative that near-rear obstacles aborted every reverse
       estop_fail_sec: 1.5          # s; stuck this long -> built-in reverse recovery
-      throttle_scale: 0.35         # m/s at action=1 -- raised 0.25->0.35 (2026-07-30);
+      # 2026-08-18 speed raise: 0.35 -> 0.70. Training used a 2.0 m/s scale (obs[1096] is
+      # fwd/2.0), so at 0.35 the policy sat far outside its training regime -- the 6-frame
+      # lidar stack spanned only 0.29 m of travel vs 1.66 m in sim, leaving the temporal
+      # channels near-dead. velocity_smoother max_velocity[0] raised 0.36 -> 0.75 to match
+      # (MUST stay >= this value, see the note below).
+      # OLD: throttle_scale: 0.35
+      throttle_scale: 0.70
+      # (original comment for the 0.35 value:)
+      #                            # m/s at action=1 -- raised 0.25->0.35 (2026-07-30);
                                    # velocity_smoother's max_velocity raised to 0.36 to match
                                    # (must stay >= throttle_scale, else linear.x gets clipped
                                    # while angular.z passes through unclipped, distorting
@@ -88,12 +96,33 @@ controller_server:
       #   ros2 param set /controller_server FollowPath.policy_authority full
       # (the value must not be "off"/"none" -- the ros2 param CLI parses those as booleans)
       policy_authority: "obstacles"
-      blend_clear_dist: 1.6        # m of clear corridor ahead -> pure pursuit has full authority
-      blend_obstacle_dist: 0.8     # m of clear corridor ahead -> policy has full authority
+      # Raised from 1.6 / 0.8 because bypassing a dynamic obstacle took far too long. Pure
+      # pursuit only tracks the path -- it does not avoid anything -- so with the old values
+      # the robot did not genuinely start avoiding until 1.6 m and only got full authority at
+      # 0.8 m. At 0.35 m/s that is ~2.3 s of closing distance before it could really steer,
+      # and if it had not cleared by estop_distance (0.30 m) it stopped, waited estop_fail_sec
+      # (1.5 s), reversed at 0.10 m/s and re-approached -- a 5-10 s round trip. Starting the
+      # handover at 2.5 m and finishing it by 1.2 m lets it steer around early enough that the
+      # stop/reverse path is rarely reached. It also eases the rejoin_cross_track tug-of-war
+      # below: while avoiding, the robot leaves the plan, and the old 0.8 m threshold handed
+      # steering straight back to pure pursuit (i.e. back toward the obstacle) as soon as
+      # clearance opened up slightly.
+      # If open-ground weaving returns, walk these back toward 2.0 / 1.0.
+      blend_clear_dist: 2.5        # m of clear corridor ahead -> pure pursuit has full authority
+      blend_obstacle_dist: 1.2     # m of clear corridor ahead -> policy has full authority
       blend_half_width: 0.35       # m; corridor half-width the clearance is measured in -- a
                                    # CORRIDOR not a cone, so hallway walls being passed don't
                                    # hand the steering back to the policy
-      lookahead_dist: 0.7          # m; pure-pursuit lookahead (min turning radius is 0.31 m)
+      lookahead_dist: 0.7          # m; FALLBACK fixed lookahead, used only if lookahead_time is 0
+      # Speed-adaptive lookahead (2026-08-18). A fixed 0.7 m is 2.0 s of preview at 0.35 m/s
+      # but only 1.0 s at 0.70 m/s -- too short, and pure pursuit oscillates. These hold the
+      # preview TIME constant instead:  lookahead = clamp(|v| * lookahead_time, min, max)
+      #   0.35 m/s -> 0.70 m   (same as before)
+      #   0.70 m/s -> 1.40 m
+      # set lookahead_time: 0.0 to disable and fall back to lookahead_dist above
+      lookahead_time: 2.0
+      lookahead_min: 0.5
+      lookahead_max: 2.0
       curve_slowdown: 0.4          # fraction of throttle_scale given up at full steering lock
       rejoin_cross_track: 0.45     # m off the plan -> pure pursuit takes over to rejoin
       max_cross_track: 1.2         # m off the plan for max_cross_track_sec -> fail the

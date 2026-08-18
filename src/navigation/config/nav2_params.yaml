@@ -261,12 +261,27 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # reverted 2026-07-30 -- see local_costmap's inflation_layer comment: caused
-        # hesitant/roundabout paths in congested areas, no actual safety benefit since
-        # real collision avoidance is via footprint + the RL controller's lidar checks.
-        # Narrowed further (0.35->0.25) same reasoning.
-        cost_scaling_factor: 5.5
-        inflation_radius: 0.25
+        # 2026-08-09: widened again (0.25 -> 0.35) with a much gentler decay (5.5 -> 3.0),
+        # to stop the global plan hugging obstacles. This is the GLOBAL costmap only -- the
+        # local one stays at 0.25/5.0 deliberately. When both were widened on 2026-07-30 the
+        # result was hesitant, roundabout behaviour in tight spots; only the global one
+        # shapes where the path is drawn, so the local costmap does not need to change.
+        #
+        # Beyond inflation_radius the cost is exactly zero, so the planner has no reason at
+        # all to keep further away than this number -- 0.25 was the actual cap on how much
+        # clearance the plan could ever prefer. cost_scaling_factor is the decay rate: at 5.5
+        # the cost had already collapsed by ~0.2 m, so even inside the radius there was
+        # barely any gradient pushing the path outward. 3.0 keeps a real gradient across the
+        # whole 0.35 m.
+        #
+        # Measured from map_01: median clearance in drivable space is only 0.25 m and the
+        # most open point in the entire map is 1.25 m. So a uniform 0.30 m of clearance is
+        # not physically available everywhere -- this is a PREFERENCE, not a guarantee.
+        # Inflation never blocks anything (only the footprint does), so narrow-but-passable
+        # gaps stay usable; they just cost more, and the planner takes an open route instead
+        # when one exists.
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.35
       always_send_full_costmap: True
   global_costmap_client:
     ros__parameters:
@@ -324,7 +339,12 @@ planner_server:
       reverse_penalty: 2.0
       change_penalty: 0.0
       non_straight_penalty: 1.2
-      cost_penalty: 2.0
+      # 2.0 -> 3.5 (2026-08-09): how heavily the Hybrid-A* search weighs costmap cost against
+      # path length. Widening the global inflation above only creates the gradient; this is
+      # what makes the planner actually pay to stay off it, instead of taking the short line
+      # past an obstacle because the detour costs more than the proximity. Too high and it
+      # starts preferring silly detours -- back off toward 2.5 if that shows up.
+      cost_penalty: 3.5
       retrospective_penalty: 0.015
       lookup_table_size: 20.0
       cache_obstacle_heuristic: false
@@ -406,7 +426,11 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.36, 0.0, 1.0]
+    # 2026-08-18: raised with throttle_scale 0.35 -> 0.70. This MUST stay >= throttle_scale:
+    # the smoother clips linear.x but passes angular.z through (scale_velocities: False), so
+    # any clipping inflates the executed curvature.
+    # OLD: max_velocity: [0.36, 0.0, 1.0]
+    max_velocity: [0.75, 0.0, 1.0]
     min_velocity: [-0.36, 0.0, -1.0]
     # angular accel tightened 3.2 -> 1.8 rad/s^2 (2026-07-28): second-stage smoothing for
     # left-right weave during normal RL-driven navigation, complementing each RL
@@ -443,8 +467,29 @@ collision_monitor:
       # approach polygons take their shape from footprint_topic (points would be ignored);
       # the local costmap publishes the real JetAcker footprint configured there
       footprint_topic: "local_costmap/published_footprint"
-      time_before_collision: 1.2   # s; cmd scaled so no collision happens within this horizon
-      simulation_time_step: 0.1
+      # 2026-08-18: 1.2 -> 0.8, with throttle_scale 0.35 -> 0.70.
+      # This is a BRAKING horizon only -- collision_monitor never steers, so obstacle DODGING
+      # is unaffected (that is the controller's blend_clear_dist: 2.5 handover to the policy).
+      # Effect: allowed speed is v_out = d_free / this, so 1.2 -> 0.8 is a flat 1.5x wherever
+      # the monitor is active (turns, head-on approaches, paths not aligned with the corridor).
+      # It does NOT change speed in open corridors -- forward clearance there is ~4 m and the
+      # monitor never engages.
+      # Safety at 0.70 m/s: full speed is now held until the gap is 0.86 m (was 1.14 m), which
+      # leaves 0.56 m of free space; worst-case stop needs 0.245 m (0.210 s reaction across
+      # lidar 7.9 Hz + controller 30 Hz + smoother 20 Hz, then 0.098 m of decel at 2.5 m/s^2)
+      # -> 0.315 m margin. Do not go below 0.8; at 0.6 the margin nearly vanishes.
+      # estop_distance (0.30 m, in nav2_controller_rl_v5.yaml) is a separate hard layer and
+      # still applies unchanged.
+      # OLD: time_before_collision: 1.2
+      time_before_collision: 0.8
+      # 2026-08-18: 0.1 -> 0.05. collision_monitor quantizes predicted collision time to this
+      # step, so the scaled output velocity moves in jumps (0.088 m/s at 0.1 s / 0.70 m/s;
+      # 0.044 m/s at 0.05 s). It sits AFTER velocity_smoother in the chain
+      # (cmd_vel_smoothed -> collision_monitor -> cmd_vel), so nothing smooths those jumps --
+      # they go straight to the motors, and they doubled when throttle went 0.35 -> 0.70.
+      # Costs 2x collision checks/cycle; revert this FIRST if nav2_container gets unstable.
+      # OLD: simulation_time_step: 0.1
+      simulation_time_step: 0.05
       # tolerate a few boundary points already grazing the footprint (robot touching a wall)
       # so the RL controller's reverse escape is not zeroed while in contact
       max_points: 8
