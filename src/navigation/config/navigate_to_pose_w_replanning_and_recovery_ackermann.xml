@@ -14,7 +14,11 @@
          "unreachable goal" report instead of indefinite retrying. -->
     <RecoveryNode number_of_retries="60" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
-        <RateController hz="1.0">
+        <!-- 2026-08-20: 1.0 -> 2.0 Hz. Half the replan latency when an unmapped obstacle
+             appears; see the global_costmap update_frequency comment in nav2_params.yaml for
+             the full latency budget. planner_server's expected_planner_frequency is already
+             2.0, so this matches what that was configured for. -->
+        <RateController hz="2.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
             <!-- Keep the current path while the goal is unchanged, the path is still
                  collision-free, AND it isn't stale -- replan otherwise. Unconditional 1 Hz
@@ -55,17 +59,27 @@
           </RecoveryNode>
         </RateController>
         <RecoveryNode number_of_retries="1" name="FollowPath">
-          <!-- RL first (2 tries, with a local costmap clear between them via the inner
-               RecoveryNode) -- if it keeps throwing "boxed in" / oscillating, fall back to
-               TEB (controller_id="FollowPathTEB", config/nav2_controller_rl.yaml) so the
-               robot still actually reaches the goal instead of the whole action aborting. -->
-          <Fallback name="RLThenTEBFallback">
-            <RecoveryNode number_of_retries="2" name="FollowPathRL">
-              <FollowPath path="{path}" controller_id="FollowPath"/>
-              <ClearEntireCostmap name="ClearLocalCostmap-RL" service_name="local_costmap/clear_entirely_local_costmap"/>
-            </RecoveryNode>
-            <FollowPath path="{path}" controller_id="FollowPathTEB"/>
-          </Fallback>
+          <!-- 2026-08-24: the TEB fallback that used to sit here was REMOVED. It was a freeze
+               trap: after 2 RL failures the Fallback switched to FollowPathTEB permanently,
+               and TEB cannot handle the exact situation that triggered the switch. Its config
+               has allow_init_with_backwards_motion: False (so it can never reverse away from a
+               static obstacle) and min_turning_radius: 0.7 m against this robot's real 0.31 m,
+               so with something parked 0.3 m ahead it finds no feasible trajectory at all.
+               The Fallback then stayed in the TEB branch and the robot simply stood still,
+               with the one controller that CAN reverse out never getting another turn.
+               RL now retries instead, with a local costmap clear between attempts. Each RL
+               attempt already runs its own 3 step reverse escalation internally (direction
+               chosen by rear clearance, forced flip on attempt 2, corridor aware steer), so
+               6 outer retries is a lot of genuinely different maneuvers. If they all fail the
+               outer NavigateRecovery still has BackUp plus costmap clears, 60 times.
+               FollowPathTEB stays declared in controller_plugins and can still be selected by
+               parameter, but its settings need fixing first: min_turning_radius 0.32,
+               allow_init_with_backwards_motion true, and a real footprint instead of the
+               0.05 m circle it currently claims. -->
+          <RecoveryNode number_of_retries="6" name="FollowPathRL">
+            <FollowPath path="{path}" controller_id="FollowPath"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-RL" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </RecoveryNode>
           <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
         </RecoveryNode>
       </PipelineSequence>

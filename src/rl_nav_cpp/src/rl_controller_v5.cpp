@@ -147,7 +147,28 @@ public:
     declareParam("goal_change_thresh", 0.5);     // m endpoint move that counts as a new goal -> reset GRU
     declareParam("lidar_angle_offset", 0.0);     // rad; bearing of training ray 0 in the /scan frame
     declareParam("lidar_ccw", true);             // increasing ray index = CCW (REP-103)
-    declareParam("lidar_min_range", 0.22);       // m; closer returns are the robot's own
+    // 2026-08-25: 0.22 -> 0.16. 0.22 masked a TOUCHED front wall, because the front bumper
+    // sits 0.196 m from the lidar and a wall can never read closer than that. Once masked,
+    // frontCorridorMin returned LIDAR_CAP, checkEmergencyStop() went FALSE, estop_timing_
+    // reset, and the 1.5 s timer that starts the reverse recovery could never complete -- the
+    // robot froze against the wall commanding forward while the collision monitor zeroed it.
+    // It only showed up above ~0.35 m/s, where braking distance (0.135 m at 0.45) exceeds the
+    // 0.104 m between estop_distance and the bumper, so the robot always ends up touching.
+    // 0.16 still masks the robot's own sides (0.130 m from the lidar) but leaves the front
+    // bumper line (0.196 m) visible.
+    // IF THE ROBOT E-STOPS PERMANENTLY WITH NOTHING IN FRONT: the lidar is low enough to see
+    // its own front structure. Raise back live and tell someone:
+    //   ros2 param set /controller_server FollowPath.lidar_min_range 0.20
+    // 2026-08-25 MEASURED, not guessed: scripts/check_lidar_close_returns.py over 29 scans
+    // with the robot stationary in open space found ZERO returns closer than 0.35 m. The
+    // lidar sits on a raised pedestal and sees none of its own structure -- not the sides
+    // (0.130 m), not the front bumper line (0.196 m), not the compute box behind it. So this
+    // mask was protecting against nothing while blinding the controller exactly where it
+    // mattered. 0.12 is below the robot's whole outline and still 0.23 m clear of the nearest
+    // thing the lidar actually returns.
+    // OLD: declareParam("lidar_min_range", 0.22);
+    // OLD: declareParam("lidar_min_range", 0.16);
+    declareParam("lidar_min_range", 0.12);       // m; closer returns are the robot's own
                                                   // structure -> discarded (see sampleScan)
     // empirical knob: if the robot consistently, confidently steers the WRONG way (not
     // oscillating -- committing hard to one direction and never correcting, e.g. path is
@@ -159,7 +180,36 @@ public:
     declareParam("estop_release", 0.40);         // m; hysteresis: resume once the corridor clears past this
     declareParam("estop_half_width", 0.17);      // m; corridor half-width = robot half-width + margin
     declareParam("estop_fail_sec", 1.5);         // s; stuck this long -> reverse recovery (0 disables)
+    // Position-based stuck watchdog (2026-09-11). Detectors 1 and 2 below both key off
+    // something indirect -- the e-stop latch, or the scan-matched odom velocity -- and both
+    // can fail to fire while the robot is plainly not moving: an obstacle at a corner sits
+    // outside the +/-estop_half_width corridor so the e-stop never latches, and rf2o jitter
+    // against a repetitive surface keeps the twist above threshold so "pushing but not
+    // moving" never trips. A narrow estop_release band makes it worse: one noisy frame
+    // releases the e-stop and resets its 1.5 s timer.
+    // This one just asks the question directly: has the robot's POSE actually moved
+    // stuck_move_eps in the last stuck_timeout_sec? If not, back out -- but only if there is
+    // room behind, because a reverse into something just stalls and wastes the attempt.
+    // Set stuck_timeout_sec: 0.0 to disable.
+    declareParam("stuck_timeout_sec", 5.0);    // s standing still before backing out
+    declareParam("stuck_move_eps", 0.05);      // m the pose must move to count as not stuck
+    declareParam("stuck_rear_min", 0.50);      // m of rear clearance (from the lidar) required;
+                                               // the rear bumper is 0.284 m back, so this is
+                                               // ~0.22 m of real space behind the robot
     declareParam("reverse_speed", 0.10);         // m/s; built-in reverse recovery speed
+    // Rear-clearance-adaptive reverse speed (2026-08-21). collision_monitor projects the
+    // footprint backwards by reverse_speed * time_before_collision, so the speed itself sets
+    // how much room it demands behind: at 0.10 m/s it needs 0.153 m behind the rear bumper,
+    // at 0.06 m/s only 0.096 m. The robot's own body (0.18 m) is the rest of that envelope
+    // and cannot be trimmed -- the URDF chassis already reaches -0.148 m, leaving just 0.032 m
+    // of padding in the footprint. So slowing the reverse is the ONLY way to buy rear room,
+    // and it buys about 5.7 cm.
+    // Applied only where it is actually needed: a flat reduction would make every reverse 65%
+    // slower (0.35 m takes 5.8 s instead of 3.5 s) for clearance that is not needed in the
+    // open. Set reverse_speed_tight equal to reverse_speed to disable.
+    declareParam("reverse_speed_tight", 0.06);   // m/s used when the rear is tight
+    declareParam("reverse_tight_rear", 0.50);    // m rear range (from lidar) at/below which tight applies
+    declareParam("reverse_open_rear", 1.10);     // m rear range at/above which full reverse_speed applies
     declareParam("reverse_dist", 0.80);          // m; hard cap on how far a recovery may back up
     declareParam("reverse_stall_sec", 0.5);      // s; no real motion this long while reversing
                                                  // -> rear contact likely, stop grinding (was 0.8)
@@ -177,6 +227,19 @@ public:
     declareParam("reverse_min_travel", 0.35);    // m the first attempt must back up
     declareParam("reverse_min_travel_step", 0.15);  // m added per consecutive failed attempt
     declareParam("reverse_steer", 0.60);         // rad; first-attempt steer (0.60 = full lock)
+    // Corridor-aware reverse steer (2026-08-19). Full lock buys 64 deg of heading per 0.35 m
+    // reversed, which is what an open-space 3-point turn wants -- but inside a narrow corridor
+    // it is actively harmful: it swings the robot FURTHER off the corridor axis (so the next
+    // forward attempt e-stops sooner) and the maneuver cannot even complete, because backing
+    // 0.35 m at full lock displaces the body 0.177 m sideways while a 0.60 m corridor only
+    // leaves 0.17 m per side. At steer 0.20 the same 0.35 m costs just 0.058 m of sideways
+    // room, so it fits and the robot realigns with the corridor instead of fighting it.
+    // reverse_steer is used when there is plenty of lateral room, reverse_steer_tight when
+    // there is not, linearly blended between the two room thresholds.
+    // Set reverse_steer_tight equal to reverse_steer to disable and get the old behaviour.
+    declareParam("reverse_steer_tight", 0.20);   // rad; steer used in a tight corridor
+    declareParam("reverse_tight_room", 0.35);    // m of side clearance at/below which tight applies
+    declareParam("reverse_open_room", 0.80);     // m of side clearance at/above which full steer applies
     declareParam("reverse_steer_step", 0.0);     // rad added per failed attempt (0.60 is already
                                                   // the mechanical max, so this only bites if
                                                   // reverse_steer is lowered)
@@ -219,6 +282,48 @@ public:
     declareParam("lookahead_time", 2.0);         // s of preview to hold at any speed (0 = off)
     declareParam("lookahead_min", 0.5);          // m; floor (min turning radius is 0.31 m)
     declareParam("lookahead_max", 2.0);          // m; ceiling, stops it running off long straights
+    // Clearance-based speed limit (2026-08-20). curve_slowdown eases off for CURVATURE but
+    // nothing eased off for how much ROOM there is, so the robot entered congested space at
+    // full speed. That matters because collision_monitor predicts 1.2 s ahead and rotates the
+    // footprint while doing so, and that swept area grows with speed even though the robot's
+    // physical turning geometry does not: at full lock it needs 0.56 m of lateral room at
+    // 0.20 m/s but 0.91 m at 0.50 m/s. In a 0.6-1.0 m gap the 0.50 m/s sweep does not fit, so
+    // collision_monitor scales cmd_vel to ~0, the robot stops moving, and detector 2
+    // ("commanding forward but not moving") fires a reverse recovery 1.5 s later -- forward,
+    // vetoed, reverse, forward... This is why the robot got stuck in congested space only
+    // AFTER the speed was raised; at the old 0.2 m/s cap the sweep always fitted.
+    // Slowing down where it is tight shrinks the sweep back below the available gap, so the
+    // veto never happens and the false "stuck" never fires. Open ground is unaffected.
+    // Set speed_clearance_factor: 1.0 to disable.
+    declareParam("speed_clearance_min", 0.80);    // m of corridor ahead at/below which the floor applies
+    declareParam("speed_clearance_max", 2.00);    // m of corridor ahead at/above which full speed applies
+    declareParam("speed_clearance_factor", 0.40); // fraction of throttle_scale allowed when tight
+    // Bypass-side preference (2026-08-31). When something blocks the driving corridor the
+    // robot has to commit to going round it on one side, and nothing here made that choice on
+    // CLEARANCE: pure pursuit follows whichever way the plan happens to go, and the policy
+    // does whatever it learned. Either can commit to the tighter side and then get stuck.
+    // When the corridor ahead is blocked AND one side is clearly more open than the other,
+    // the steering sign is forced toward the open side (its magnitude is left alone, so the
+    // policy still decides HOW HARD to turn -- only WHICH WAY is overridden).
+    // Uses frontSideOpenness(): the mean range over bearings 20-70 deg (left) and 290-340 deg
+    // (right). Those sectors deliberately exclude the blocker dead ahead -- it sits inside
+    // both 90-deg quadrants and would make the two sides read identical, which is what made
+    // the old sideClearance() comparison useless in exactly this situation.
+    // bypass_prefer_open: 0.0 disables.
+    // Rewritten 2026-09-14. The first version asked "which side has MORE clearance?" and
+    // steered there. That is a continuous preference for openness, so it necessarily pulls the
+    // robot away from the goal and into open space -- it produced exactly the long detours it
+    // was blamed for. The design was wrong, not the tuning.
+    // Clearance is a FEASIBILITY TEST, not a preference: a side is either wide enough to pass
+    // or it is not, and 3 m of room is worth no more than 0.6 m. So the viable sides are those
+    // with at least bypass_need_open, and among those the GOAL picks -- never the openness.
+    // With neither side viable it does not override at all; e-stop and reverse handle that.
+    declareParam("bypass_prefer_open", 1.0);   // 0 = off
+    declareParam("bypass_trigger_dist", 1.5);  // m; lane blocked closer than this -> choose a side
+    declareParam("bypass_clear_dist", 2.0);    // m; lane clear past this -> release the latch
+    declareParam("bypass_need_open", 0.35);    // m of side room that counts as passable (robot
+                                               // half-width 0.13 + ~0.12 margin, seen at ~45 deg
+                                               // where frontSideOpenness is centred)
     declareParam("curve_slowdown", 0.4);         // fraction of throttle_scale given up at full lock
     declareParam("rejoin_cross_track", 0.45);    // m off the plan -> pure pursuit takes the steering
                                                  // back to rejoin (obstacle authority still wins)
@@ -507,7 +612,69 @@ public:
       // not lost -- the corridor e-stop (estop_distance) and the collision monitor are
       // separate layers and both still apply.
       d = w_policy * d + (1.0 - w_policy) * d_pp;
+
+      // --- bypass-side preference (see bypass_prefer_open where it is declared) ---
+      // Only while the corridor is genuinely blocked; in the open the plan should be followed
+      // as-is, not bent toward whichever side happens to be emptier.
+      if (node_->get_parameter(prefix("bypass_prefer_open")).as_double() > 0.5) {
+        // Gate on the NARROW driving corridor: something is genuinely in the lane, not merely
+        // beside the robot. The old gate used blend_half_width (0.35 -> a 0.7 m wide corridor),
+        // which indoors is true near almost any wall, so it fired constantly.
+        double trig = node_->get_parameter(prefix("bypass_trigger_dist")).as_double();
+        double rel = node_->get_parameter(prefix("bypass_clear_dist")).as_double();
+        float lane = frontCorridorMin(node_->get_parameter(prefix("estop_half_width")).as_double());
+
+        if (lane > rel) {
+          bypass_side_ = 0;                    // lane clear -> forget the committed side
+        } else if (lane < trig && bypass_side_ == 0) {
+          // Decide ONCE, then hold it, so the robot commits instead of flip-flopping.
+          double need = node_->get_parameter(prefix("bypass_need_open")).as_double();
+          float ol = frontSideOpenness(true), orr = frontSideOpenness(false);
+          bool ok_left = ol >= need, ok_right = orr >= need;
+          const char * why = nullptr;
+          if (ok_left && ok_right) {
+            // Both sides fit. Clearance has nothing more to say -- extra room is worth
+            // nothing once the robot fits -- so the GOAL decides, not the openness.
+            bypass_side_ = (gangle > 0.0) ? 1 : -1;
+            why = "both fit, goal side";
+          } else if (ok_left) {
+            bypass_side_ = 1;  why = "only left fits";
+          } else if (ok_right) {
+            bypass_side_ = -1; why = "only right fits";
+          } else {
+            bypass_side_ = 0;                  // nowhere to pass; e-stop/reverse will handle it
+          }
+          if (why) {
+            RCLCPP_INFO(logger_,
+              "bypass (%s): passing on the %s (lane %.2f m, open L/R %.2f/%.2f, need %.2f)",
+              why, bypass_side_ > 0 ? "LEFT" : "RIGHT", lane, ol, orr, need);
+          }
+        }
+        // Committed: only correct the steering if it is heading for the side we rejected.
+        if (bypass_side_ != 0 && d * bypass_side_ < 0.0) {
+          d = bypass_side_ * std::abs(d);
+        }
+      }
       v = std::max(v, v_pp);
+    }
+
+    // --- clearance-based speed limit (see speed_clearance_* where they are declared) ---
+    // Applied here so it caps normal driving only: docking, the e-stop and the reverse
+    // recovery all assign v explicitly further down and are deliberately not affected.
+    {
+      double sc_lo = node_->get_parameter(prefix("speed_clearance_min")).as_double();
+      double sc_hi = node_->get_parameter(prefix("speed_clearance_max")).as_double();
+      double sc_f = node_->get_parameter(prefix("speed_clearance_factor")).as_double();
+      if (sc_f < 1.0 && sc_hi > sc_lo) {
+        // computed independently of the blend block above -- that one only runs when the plan
+        // projects and policy_authority is not "full", but this cap must always apply.
+        float room = frontCorridorMin(node_->get_parameter(prefix("blend_half_width")).as_double());
+        double w_open = clampf((room - sc_lo) / (sc_hi - sc_lo), 0.0, 1.0);
+        double cap = throttle * (sc_f + w_open * (1.0 - sc_f));
+        if (cap < v) {
+          v = cap;
+        }
+      }
     }
 
     // --- terminal docking ---
@@ -598,8 +765,50 @@ public:
 
       bool est_stuck = estop_timing_ && (now - estop_since_).seconds() > fail_after;
       bool push_stuck = nomove_timing_ && (now - nomove_since_).seconds() > fail_after;
-      if (est_stuck || push_stuck) {
+
+      // detector 3: position watchdog (see stuck_timeout_sec where it is declared)
+      bool pos_stuck = false;
+      double stuck_to = node_->get_parameter(prefix("stuck_timeout_sec")).as_double();
+      // Not gated on !docking any more: dock_dist is 1.0 m, and the logged stuck episodes sat
+      // right at ~1.02 m from the goal, so excluding docking switched the watchdog off in
+      // exactly the place it was needed. Docking moves at dock_speed 0.12 m/s = 0.6 m per 5 s,
+      // far above stuck_move_eps, so it cannot trip this falsely.
+      if (stuck_to > 0.0) {
+        if (!have_stuck_ref_) {
+          stuck_ref_pos_ = robot;
+          stuck_ref_time_ = now;
+          have_stuck_ref_ = true;
+        }
+        double eps = node_->get_parameter(prefix("stuck_move_eps")).as_double();
+        if (norm2({robot.x - stuck_ref_pos_.x, robot.y - stuck_ref_pos_.y}) > eps) {
+          stuck_ref_pos_ = robot;          // it moved -- restart the window from here
+          stuck_ref_time_ = now;
+        } else if ((now - stuck_ref_time_).seconds() > stuck_to) {
+          float back = rearArcMin();
+          double need = node_->get_parameter(prefix("stuck_rear_min")).as_double();
+          if (back >= need) {
+            pos_stuck = true;
+          } else {
+            RCLCPP_WARN(logger_,
+              "STUCK for %.1f s but only %.2f m behind (need %.2f) -> not reversing into it",
+              (now - stuck_ref_time_).seconds(), back, need);
+          }
+          // either way, restart the window so this is re-evaluated every stuck_to seconds
+          // rather than spamming every 30 Hz cycle
+          stuck_ref_pos_ = robot;
+          stuck_ref_time_ = now;
+        }
+      } else {
+        have_stuck_ref_ = false;
+      }
+
+      if (est_stuck || push_stuck || pos_stuck) {
         reversing_ = true;
+        // The position watchdog is deliberately NOT re-seeded here (it was, on 09-11, and that
+        // broke it): a failed reverse moves ~0.0005 m, so re-seeding on every attempt restarted
+        // the 5 s window each time and it never elapsed while the robot looped e-stop -> reverse
+        // -> "boxed in" -> e-stop. The window now measures time since the robot last REALLY
+        // moved; a reverse that works moves ~0.35 m and resets it naturally.
         reverse_start_ = robot;
         reverse_begin_ = now;
         // progress watchdog for the reverse (see rev_stalled below)
@@ -670,12 +879,30 @@ public:
             reverse_dir_ < 0.0 ? "yaw-left/back-right" : "yaw-right/back-left",
             why, failed_reverses_ + 1, rear_left, rear_right, front_left, front_right);
         }
-        RCLCPP_WARN(logger_, "STUCK (%s) -> reversing out", est_stuck ? "wall in forward arc" : "pushing but not moving");
+        RCLCPP_WARN(logger_, "STUCK (%s) -> reversing out",
+                    est_stuck ? "wall in forward arc"
+                    : push_stuck ? "pushing but not moving"
+                    : "position unchanged for stuck_timeout_sec");
       }
     }
 
     if (reversing_) {
       double rev_speed = node_->get_parameter(prefix("reverse_speed")).as_double();
+      // Ease the reverse speed down when the rear is tight -- see reverse_speed_tight above.
+      // rear_min is measured from the LIDAR, which sits 0.284 m ahead of the rear bumper.
+      // lidar_min_range (0.22) masks nothing behind the robot, because 0.22 < 0.284, so the
+      // rear corridor reading is usable here (unlike reverse_rear_stop, which is dead because
+      // its 0.22 threshold sits exactly at the mask).
+      {
+        double rs_tight = node_->get_parameter(prefix("reverse_speed_tight")).as_double();
+        double rr_lo = node_->get_parameter(prefix("reverse_tight_rear")).as_double();
+        double rr_hi = node_->get_parameter(prefix("reverse_open_rear")).as_double();
+        if (rs_tight < rev_speed && rr_hi > rr_lo) {
+          double back = rearArcMin();
+          double w_open = clampf((back - rr_lo) / (rr_hi - rr_lo), 0.0, 1.0);
+          rev_speed = rs_tight + w_open * (rev_speed - rs_tight);
+        }
+      }
       double rev_dist = node_->get_parameter(prefix("reverse_dist")).as_double();
       double rear_stop = node_->get_parameter(prefix("reverse_rear_stop")).as_double();
       float rear_min = rearArcMin();
@@ -726,8 +953,17 @@ public:
       // stall_sec from there, the reverse is cut immediately -- whether that happens at the
       // very start or half a metre in.
       double stall_sec = node_->get_parameter(prefix("reverse_stall_sec")).as_double();
+      // Progress threshold must scale with the COMMANDED reverse speed. It used to be the
+      // fixed REV_PROGRESS_EPS (0.03 m), which was fine while reverse_speed was always 0.10
+      // (0.05 m per 0.5 s window, comfortably clear). Once reverse_speed became variable, a
+      // 0.06 m/s reverse covered exactly 0.030 m per window -- dead on the threshold -- so
+      // normal slip tripped rev_stalled, the reverse aborted at travelled ~ 0, and the robot
+      // threw "boxed in" on the first attempt instead of backing out of a corner it used to
+      // escape from. 60% of the distance the commanded speed should cover leaves margin at
+      // any speed; the 0.02 m floor keeps it above odometry noise.
+      double prog_eps = std::max(0.02, 0.6 * rev_speed * stall_sec);
       if (norm2({robot.x - rev_progress_pos_.x, robot.y - rev_progress_pos_.y})
-            > REV_PROGRESS_EPS) {
+            > prog_eps) {
         rev_progress_pos_ = robot;
         rev_progress_time_ = now;
       }
@@ -752,7 +988,7 @@ public:
         // the only signal. Only sustained forward progress (checked above) clears this.
         ++failed_reverses_;
         // DO NOT remove the `travelled < 0.10 && !front_open` clause below. Tried that on
-        // 2026-08-18 (reasoning: it fires on the very first attempt and so prevents the
+        // 2026-08-19 (reasoning: it fires on the very first attempt and so prevents the
         // 3-attempt escalation from ever running) and the robot stopped dead at a wall.
         // Reason: failed_reverses_ is reset to 0 after RESUME_SETTLE_SEC (5 s) of settled
         // motion, and the small shuffle between attempts is enough to trigger that reset --
@@ -804,6 +1040,21 @@ public:
         double st0 = node_->get_parameter(prefix("reverse_steer")).as_double();
         double st_step = node_->get_parameter(prefix("reverse_steer_step")).as_double();
         double reverse_steer = std::min(STEER_SCALE, st0 + failed_reverses_ * st_step);
+        // Ease the steer down when the robot is inside a narrow corridor -- see the
+        // reverse_steer_tight comment where the parameters are declared.
+        {
+          double tight = node_->get_parameter(prefix("reverse_steer_tight")).as_double();
+          double room_lo = node_->get_parameter(prefix("reverse_tight_room")).as_double();
+          double room_hi = node_->get_parameter(prefix("reverse_open_room")).as_double();
+          double room = lateralClearance();
+          double w_open = clampf((room - room_lo) / std::max(room_hi - room_lo, 1e-3), 0.0, 1.0);
+          double corridor_steer = tight + w_open * (reverse_steer - tight);
+          if (corridor_steer < reverse_steer) {
+            RCLCPP_INFO(logger_, "corridor %.2f m -> reverse steer %.2f (open-space value %.2f)",
+                        room, corridor_steer, reverse_steer);
+          }
+          reverse_steer = corridor_steer;
+        }
         // use the direction locked in when this reverse started (reverse_dir_), NOT a
         // fresh gangle sign every frame -- see the comment where reverse_dir_ is set.
         d = reverse_dir_ * reverse_steer;
@@ -932,6 +1183,8 @@ private:
     estopped_ = false;   // re-evaluated on the next control step from the fresh scan
     estop_timing_ = false;
     nomove_timing_ = false;
+    bypass_side_ = 0;
+    have_stuck_ref_ = false;
     reversing_ = false;
     failed_reverses_ = 0;
     have_settled_since_ = false;
@@ -1073,6 +1326,25 @@ private:
   // on the left, 290..340 deg (rays 145..170) on the right. That excludes the dead-ahead
   // blocker AND the pure-side walls being passed at 90 deg. MEAN, not min, so one stray ray
   // cannot veto an otherwise open side.
+  // Corridor half-width: how much room the robot has straight out to its SIDES. Rays 35..55
+  // are bearings 70..110 deg (left beam) and 125..145 are 250..290 deg (right beam) -- narrow
+  // bands around +/-90 deg, so this measures the corridor the robot is inside rather than
+  // anything ahead of or behind it. Returns the tighter of the two sides.
+  float lateralClearance() const
+  {
+    const std::vector<float> & fr = frameAtOffset(0);
+    float best = LIDAR_CAP;
+    for (int i = 35; i <= 55; ++i) {
+      float r = fr[i] * LIDAR_CAP;
+      if (r >= 0.05f) best = std::min(best, r);
+    }
+    for (int i = 125; i <= 145; ++i) {
+      float r = fr[i] * LIDAR_CAP;
+      if (r >= 0.05f) best = std::min(best, r);
+    }
+    return best;
+  }
+
   float frontSideOpenness(bool left) const
   {
     const std::vector<float> & fr = frameAtOffset(0);
@@ -1336,8 +1608,13 @@ private:
   bool estopped_{false};
   bool estop_timing_{false};
   rclcpp::Time estop_since_;
+  int bypass_side_{0};              // 0 none, +1 pass left, -1 pass right; latched until clear
   bool nomove_timing_{false};
   rclcpp::Time nomove_since_;
+  Vec2 stuck_ref_pos_{0, 0};        // where the position watchdog last saw real movement
+  rclcpp::Time stuck_ref_time_;
+  bool have_stuck_ref_{false};      // lazily seeded -- a default rclcpp::Time has another
+                                    // clock type and subtracting it from now() throws
   bool reversing_{false};
   double reverse_dir_{1.0};   // decided once when the reverse starts, held for its duration
   Vec2 reverse_start_{0, 0};

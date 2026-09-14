@@ -27,9 +27,23 @@
     debug_logging: false
     throttle_scans: 1
     transform_publish_period: 0.02 #if 0 never publishes odometry
-    map_update_interval: 0.2
+    # 2026-09-04: 0.2 -> 2.0 (slam_toolbox default is 5.0).
+    # This only controls how often the occupancy grid is RASTERISED for output; it does not
+    # improve the pose graph at all. At 0.2 the whole map was being rebuilt 5 times a second,
+    # which on this Jetson competes with the Ceres optimiser -- the optimiser falls behind,
+    # poses go stale, and the map visibly distorts. That is the "localisation suddenly goes
+    # bad while mapping" symptom.
+    # 2.0 still updates RViz often enough to drive around by.
+    # OLD: map_update_interval: 0.2
+    map_update_interval: 2.0
     resolution: 0.05
-    max_laser_range: 12.0 #for rastering images
+    # 2026-09-04: 12.0 -> 8.0. Indoors, returns beyond ~8 m are mostly through doorways,
+    # glass and reflections, and are unreliable -- but the scan matcher weights them the same
+    # as solid nearby structure, which degrades every match. Capping at 8 m keeps the matcher
+    # on geometry it can trust. (The A1 can see 12 m; this is about what is USEFUL, not what
+    # is possible.)
+    # OLD: max_laser_range: 12.0
+    max_laser_range: 8.0 #for rastering images
     minimum_time_interval: 0.5
     transform_timeout: 0.2
     tf_buffer_duration: 30.
@@ -39,18 +53,78 @@
     # General Parameters
     use_scan_matching: true
     use_scan_barycenter: true
-    minimum_travel_distance: 0.1
+    # 2026-09-04: 0.1 -> 0.25 (slam_toolbox default is 0.5).
+    # At 0.1 m two consecutive scans are almost identical, so there is barely any parallax for
+    # the scan matcher to work with and the relative pose between them is poorly observed --
+    # every link constraint is weak, and weak constraints chained together are exactly how a
+    # map ends up not matching what the lidar actually sees. It also meant 5x the nodes, so 5x
+    # the Ceres optimiser load and 5x the loop-closure candidates, on a Jetson already running
+    # nav2 + rf2o + EKF.
+    # 0.25 gives scans enough separation to constrain each other while still being denser than
+    # the default, which suits a small indoor map.
+    # OLD: minimum_travel_distance: 0.1
+    minimum_travel_distance: 0.25
     minimum_travel_heading: 0.5
     scan_buffer_size: 20
     scan_buffer_maximum_scan_distance: 12.0
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5
+    # 2026-09-04: 6.0 -> 3.0 (back to the slam_toolbox default).
+    # Raising it to 6.0 on 08-24 was meant to fix MISSED loop closures (the same place mapped
+    # twice at an offset). In this office it causes the opposite failure instead: a live scan
+    # here reaches only 5.37 m (median 2.21 m), so a 6 m search radius spans the ENTIRE visible
+    # environment -- including the second row of desks. The two rows look nearly identical at
+    # lidar height (34% of surfaces in a scan are 3-ray "leg" fragments from desks and chairs),
+    # so the matcher happily paired one row with the other and the optimiser merged them.
+    # Driving more loops made it worse, not better: every extra pass was another chance to
+    # accept a wrong pairing.
+    # The search radius must stay BELOW the spacing between repeating structures.
+    # OLD (default): loop_search_maximum_distance: 3.0
+    # OLD: loop_search_maximum_distance: 6.0
     loop_search_maximum_distance: 3.0
     do_loop_closing: true
-    loop_match_minimum_chain_size: 10
+    # 2026-08-20: 10 -> 50. This counts NODES, not metres, so it silently depends on
+    # minimum_travel_distance above. slam_toolbox's default pairing is 0.5 m spacing x 10
+    # nodes = a 5 m chain, which is what makes the constraint strong: a loop closure has to
+    # match a long stretch of trajectory, not just one spot. With minimum_travel_distance
+    # lowered to 0.1 m here, a chain covered only 1.0 m -- a 5x weaker test -- while 5x more
+    # nodes also meant 5x more loop candidates. Result: a false loop closure was accepted and
+    # the optimizer snapped the ENTIRE map at once (a whole-map jump is always graph
+    # re-optimisation; odometry drift smears gradually instead).
+    # 50 nodes x 0.1 m restores the intended 5 m chain without giving up map resolution.
+    # OLD: loop_match_minimum_chain_size: 10
+    # 2026-08-24: 50 -> 30. 50 nodes x 0.1 m spacing demanded a 5 m run of old trajectory
+    # near the candidate; a single pass through a doorway or a brief visit never accumulates
+    # that many nodes, so real loop closures were starved. 30 still requires a 3 m chain,
+    # which keeps the constraint that a closure must match a stretch of path rather than one
+    # spot -- the reason this was raised from the default 10 in the first place.
+    # OLD (default): loop_match_minimum_chain_size: 10
+    # OLD: loop_match_minimum_chain_size: 50
+    # 2026-09-04: 30 -> 14, purely to keep the chain the same LENGTH after
+    # minimum_travel_distance changed. This counts NODES, not metres:
+    #   30 nodes x 0.10 m = 3.0 m   (what it was)
+    #   30 nodes x 0.25 m = 7.5 m   (would have become far too strict, starving real closures)
+    #   14 nodes x 0.25 m = 3.5 m   (equivalent to before)
+    # OLD (default): loop_match_minimum_chain_size: 10
+    # OLD: loop_match_minimum_chain_size: 50
+    # OLD: loop_match_minimum_chain_size: 30
+    loop_match_minimum_chain_size: 14
     loop_match_maximum_variance_coarse: 3.0
     loop_match_minimum_response_coarse: 0.35
-    loop_match_minimum_response_fine: 0.45
+    # 2026-08-20: 0.45 -> 0.55. Correlation score a candidate must beat to be accepted as a
+    # loop closure. The default is tuned for feature-rich scenes; in a plain rectangular room
+    # two different stretches of blank wall correlate well enough to pass 0.45.
+    # Raise further (0.6) if a false closure happens again; lower toward 0.45 if real loop
+    # closures stop being detected on a large map.
+    # OLD: loop_match_minimum_response_fine: 0.45
+    # 2026-09-04: 0.55 -> 0.65. In a repetitive space -- two parallel rows of identical desks
+    # -- a correlation score of 0.55 is reachable by matching the WRONG row, because at lidar
+    # height both rows present the same sparse pattern of table and chair legs. 0.65 demands a
+    # much closer match before the optimiser is allowed to fuse two places.
+    # Lower toward 0.55 only if real loop closures stop being found on a large map.
+    # OLD: loop_match_minimum_response_fine: 0.45
+    # OLD: loop_match_minimum_response_fine: 0.55
+    loop_match_minimum_response_fine: 0.65
 
     # Correlation Parameters - Correlation Parameters
     correlation_search_space_dimension: 0.5

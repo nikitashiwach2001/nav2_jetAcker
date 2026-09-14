@@ -47,11 +47,150 @@ controller_server:
       # just keeps heading its own current way), flip to -1.0 (live, no rebuild):
       #   ros2 param set /controller_server FollowPath.steer_sign -1.0
       steer_sign: 1.0
-      estop_distance: 0.30         # m; blocker in the driving corridor closer than this -> stop (0 disables)
-      estop_release: 0.40          # m; hysteresis: resume only after the corridor clears past this
-      estop_half_width: 0.17       # m; corridor half-width (robot half-width 0.11 + margin);
+      # 2026-08-31: 0.30 -> 0.27 (lidar-relative). The lidar is 0.196 m behind the front
+      # bumper, so this is 0.10 m -> 0.07 m of bumper clearance, i.e. stop later / closer.
+      # At 0.45 m/s stopping needs ~0.135 m (0.21 s of reaction across lidar 7.9 Hz +
+      # controller 30 Hz + smoother 20 Hz, then braking at 2.5 m/s^2), so the robot WILL make
+      # light contact with a wall it drives straight at. That is accepted deliberately here:
+      # since lidar_min_range came down to 0.12 the touched wall stays VISIBLE (it reads
+      # 0.196 m, well above the mask), so the e-stop latches instead of silently dropping, and
+      # the reverse recovery still fires. That was not true when the mask was 0.22.
+      # OLD: estop_distance: 0.30
+      # 2026-09-10: 0.27 -> 0.36 (bumper clearance 0.074 -> 0.16 m).
+      # 0.27 was too close for 0.45 m/s. Stopping takes ~0.110 m (0.155 s reaction across
+      # lidar 13.9 Hz + controller 30 Hz + smoother 20 Hz, then 0.041 m braking at 2.5 m/s^2),
+      # but the e-stop fired only 0.074 m before the bumper -- so the robot overshot by
+      # 0.036 m and TOUCHED whatever had stepped in front of it ("drifts and comes very close").
+      # Touching is what made it stick, not the stop itself: the footprint then overlaps an
+      # obstacle cell, Smac reports "Starting point in lethal space", no plan can be made, so
+      # FollowPath never runs and the controller's reverse recovery never gets a turn -- and
+      # the BT's BackUp is costmap-checked and vetoed there too. The robot only "escaped by
+      # itself" once the costmap or the obstacle changed on its own.
+      # 0.36 = 0.196 bumper offset + 0.110 stopping + 0.05 margin, so it now stops short.
+      # OLD: estop_distance: 0.30
+      # OLD: estop_distance: 0.27
+      # 2026-09-10 (later): 0.36 -> 0.25, on the user's explicit choice, so that estop_release
+      # could be brought down to 0.30 (release must stay above this value -- the code clamps
+      # release_d = max(estop_release, estop_distance), so a release below it silently becomes
+      # zero hysteresis).
+      # KNOWN CONSEQUENCE, accepted: at 0.45 m/s the robot needs ~0.110 m to stop but this
+      # leaves only 0.054 m before the bumper, so it will make contact (~5.6 cm overshoot) with
+      # anything that appears in front of it. Contact puts the footprint on an obstacle cell,
+      # Smac reports "Starting point in lethal space", and the robot can stick until the
+      # obstacle or costmap changes. If that returns, 0.36 is the value that stops short.
+      # OLD: estop_distance: 0.30
+      # OLD: estop_distance: 0.27
+      # OLD: estop_distance: 0.36
+      # 2026-09-10 (final): 0.25 -> 0.36. Stops ~5 cm short of contact at 0.45 m/s
+      # (0.110 m stopping distance). The 20:18 episode in nav_events.log -- 4 min 12 s stuck,
+      # 110 reverse attempts -- ran with 0.27 live and showed clr=0.01, i.e. contact; once in
+      # contact collision_monitor blocks every direction, so this is the value that matters.
+      # OLD: estop_distance: 0.30
+      # OLD: estop_distance: 0.27
+      # OLD: estop_distance: 0.36
+      # OLD: estop_distance: 0.25
+      estop_distance: 0.36         # m; blocker in the driving corridor closer than this -> stop (0 disables)
+      # 2026-08-19: 0.40 -> 0.34. The gap between estop_distance (0.30) and this is a trap:
+      # the robot stops below 0.30 and will not resume until 0.40, and in a 0.60 m corridor a
+      # 20-25 deg heading error sits right inside that band. Narrowing it shrinks the trap.
+      # estop_distance itself is deliberately NOT lowered: it is measured from the lidar, which
+      # sits 0.196 m behind the front bumper, so 0.30 already leaves only 0.10 m of bumper
+      # clearance.
+      # OLD: estop_release: 0.40
+      # REVERTED 2026-08-25 to the tuned value.
+      # OLD: estop_release: 0.34
+      # 2026-08-31: 0.40 -> 0.34, kept 0.07 m above estop_distance so the hysteresis band
+      # stays the same width as before rather than widening into a trap.
+      # OLD: estop_release: 0.40
+      # 2026-09-10: 0.34 -> 0.43, raised with estop_distance. It MUST stay above it -- at 0.34
+      # it would have been below the new 0.36 stop distance, which is invalid. The 0.07 m
+      # hysteresis band is kept the same width.
+      # OLD: estop_release: 0.40
+      # OLD: estop_release: 0.34
+      # 2026-09-10 (later): 0.43 -> 0.30, user's choice (resume sooner once a person moves off).
+      # Band is now 0.05 m. Measured live lidar noise: 0.18 cm median, 0.48 cm 90th pct, but up
+      # to 7.2 cm on edge rays -- and the e-stop takes the MIN over the whole corridor, so one
+      # noisy edge ray can briefly release it. There is no debounce: a single released frame
+      # resets estop_timing_, and the reverse only fires after estop_fail_sec of CONTINUOUS
+      # e-stop. If the robot stands blocked and never reverses, this band is the first suspect.
+      # OLD: estop_release: 0.40
+      # OLD: estop_release: 0.34
+      # OLD: estop_release: 0.43
+      # 2026-09-10 (final): set to 0.30 on the user's explicit instruction, knowing it is BELOW
+      # estop_distance. The code clamps it:  release_d = max(estop_release, estop_distance),
+      # so the EFFECTIVE release is 0.36 and the hysteresis band is ZERO. Consequence: the
+      # e-stop can release on a single noisy frame, which resets estop_timing_ (no debounce),
+      # so the 1.5 s reverse timer may keep restarting. If the robot stands blocked without
+      # reversing, raise this to 0.40 (4 cm band, measured-noise safe) first.
+      # OLD: estop_release: 0.43
+      estop_release: 0.30          # m; hysteresis: resume only after the corridor clears past this
+      # 2026-08-19: 0.17 -> 0.14. The old comment's "robot half-width 0.11" was stale -- the
+      # footprint in nav2_params.yaml is +/-0.13, so 0.17 was only 0.04 m of margin per side
+      # yet made the e-stop corridor 0.34 m wide against a 0.26 m robot. In a narrow curved
+      # corridor an Ackermann robot always sits 10-20 deg off axis, which swings that corridor
+      # into the side wall and latches the e-stop -- and once stopped it CANNOT straighten,
+      # because changing heading requires driving. 0.14 keeps the corridor just wider than the
+      # robot so side walls being passed stop triggering it.
+      # OLD: estop_half_width: 0.17
+      # REVERTED 2026-08-25 to the tuned value.
+      # OLD: estop_half_width: 0.14
+      estop_half_width: 0.17       # m; corridor half-width (robot half-width 0.13 + margin);
                                    # corridor, NOT a cone: side walls being passed don't trigger
       reverse_clear: 0.55          # m; reverse until the corridor ahead is clear past this...
+      # Corridor-aware reverse steer (2026-08-19). Full lock (0.60) swings 64 deg per 0.35 m
+      # reversed and needs 0.177 m of sideways room; a 0.60 m corridor only has 0.17 m per
+      # side, so the maneuver could not complete AND left the robot further off the corridor
+      # axis than it started. 0.20 costs only 0.058 m sideways and realigns instead.
+      # Blended linearly by measured side clearance between the two room thresholds.
+      # Set reverse_steer_tight: 0.60 to disable and get the old always-full-lock behaviour.
+      # Rear-clearance-adaptive reverse speed (2026-08-21). collision_monitor's backward
+      # projection is reverse_speed * time_before_collision, so a slower reverse demands less
+      # room behind: 0.10 m/s needs 0.153 m past the rear bumper, 0.06 m/s needs 0.096 m.
+      # The other 0.18 m of that envelope is the robot's own body and cannot be trimmed
+      # (URDF chassis reaches -0.148 m, so the footprint already has only 0.032 m of padding).
+      # Only ~5.7 cm is on offer, so it is applied where it matters instead of everywhere --
+      # a flat 0.06 would make every reverse 65% slower.
+      # Set reverse_speed_tight: 0.10 to disable.
+      # DISABLED 2026-08-25 (same as reverse_speed = no slowdown). Setting this to 0.06
+      # BROKE escaping from corners, which used to work. At 0.06 m/s the robot covers exactly
+      # 0.030 m in reverse_stall_sec (0.5 s) -- precisely REV_PROGRESS_EPS -- so any slip or
+      # motor deadband made the progress check fail, rev_stalled fired, the reverse aborted
+      # with travelled ~ 0, and `travelled < 0.10 && !front_open` threw "boxed in" on the very
+      # first attempt. And it fired in exactly the case this was meant to help: a tight rear.
+      # The whole feature was only ever worth ~5.7 cm of rear clearance; it is not worth this.
+      # The stall detector has since been made speed-proportional (see rl_controller_v5.cpp),
+      # so re-enabling is now safe, but leave it off unless rear clearance is a proven problem.
+      # OLD: reverse_speed_tight: 0.06
+      # Position-based stuck watchdog (2026-09-11). If the robot's pose has not moved
+      # stuck_move_eps in stuck_timeout_sec, it backs out -- but ONLY if rearArcMin() shows at
+      # least stuck_rear_min behind (from the lidar; the rear bumper is 0.284 m back, so 0.50
+      # means ~0.22 m of real room). With no room behind it logs and waits instead of
+      # reversing into something. It keys off the POSE, not the e-stop latch or the
+      # scan-matched odom velocity, so it catches the cases detectors 1 and 2 miss -- including
+      # a zero-hysteresis e-stop (estop_release 0.30 < estop_distance 0.36, clamped to 0.36)
+      # flickering on lidar noise and resetting its own 1.5 s reverse timer.
+      # Set stuck_timeout_sec: 0.0 to disable.
+      stuck_timeout_sec: 5.0
+      stuck_move_eps: 0.05
+      stuck_rear_min: 0.50
+      reverse_speed_tight: 0.10
+      reverse_tight_rear: 0.50
+      reverse_open_rear: 1.10
+      # DISABLED 2026-08-25 (0.60 = reverse_steer = off). Corridor-aware reverse steer was a
+      # response to high-speed corner traps; the tuned behaviour is full lock every time.
+      # RE-ENABLED 2026-08-27. Disabling this in the 2026-08-25 blanket revert was a mistake:
+      # unlike the other changes reverted that day, this one is about GEOMETRY, not speed, so
+      # dropping the speed back to 0.20 did nothing to compensate for it.
+      # A reverse at full lock swings the nose sideways and needs 0.42 m of lateral room; the
+      # robot is only 0.26 m wide, and a corner does not have 0.42 m. collision_monitor then
+      # zeroes cmd_vel, the robot never moves, rev_stalled fires at 0.5 s with travelled ~ 0,
+      # and `travelled < 0.10 && !front_open` throws "boxed in" -- over and over (16 BT
+      # recoveries observed). The rear being clear is irrelevant; the blockage is lateral.
+      # At 0.20 the same reverse needs only 0.31 m and fits.
+      # OLD: reverse_steer_tight: 0.60
+      reverse_steer_tight: 0.20
+      reverse_tight_room: 0.35
+      reverse_open_room: 0.80
       reverse_dist: 0.80           # m; ...capped at this distance
       reverse_rear_stop: 0.22      # m; rear bumper is ~0.16 m behind the lidar -- 0.30 was so
                                    # conservative that near-rear obstacles aborted every reverse
@@ -65,7 +204,16 @@ controller_server:
       # TRIED 0.70 -- too fast on the real robot once the driver's hidden 0.2 m/s clamp was
       # lifted (see cmd_vel_out_topic in nav2_params.yaml). Backed off to 0.50.
       # OLD: throttle_scale: 0.70
-      throttle_scale: 0.50
+      # 2026-08-25 REVERTED to 0.20. The driver used to clamp /cmd_vel to 0.2 m/s, so every
+      # threshold in this file was tuned against an EFFECTIVE 0.2 m/s for months. Removing
+      # that clamp (cmd_vel_out_topic) made the robot 2.5x faster overnight and every problem
+      # since -- freezing in congested space, 5-6 attempts to bypass, corner traps, paths
+      # hugging objects -- was a consequence of that, not an independent bug. Raise this ONE
+      # step at a time with a test run each time; 0.35 is the next step, not 0.70.
+      # OLD: throttle_scale: 0.70
+      # OLD: throttle_scale: 0.50
+      # OLD: throttle_scale: 0.20   (the tuned-for value; see the note above)
+      throttle_scale: 0.45
       # (original comment for the 0.35 value:)
       #                            # m/s at action=1 -- raised 0.25->0.35 (2026-07-30);
                                    # velocity_smoother's max_velocity raised to 0.36 to match
@@ -111,7 +259,12 @@ controller_server:
       # steering straight back to pure pursuit (i.e. back toward the obstacle) as soon as
       # clearance opened up slightly.
       # If open-ground weaving returns, walk these back toward 2.0 / 1.0.
-      blend_clear_dist: 2.5        # m of clear corridor ahead -> pure pursuit has full authority
+      # 2026-08-31: 2.5 -> 1.5 (lidar-relative). The lidar sits 0.196 m behind the front
+      # bumper, so this is 2.30 m -> 1.30 m measured from the bumper, which is what was asked
+      # for. The policy now takes over steering later, so the robot stops swerving around
+      # things while they are still a long way off.
+      # OLD: blend_clear_dist: 2.5
+      blend_clear_dist: 1.5        # m of clear corridor ahead -> pure pursuit has full authority
       blend_obstacle_dist: 1.2     # m of clear corridor ahead -> policy has full authority
       blend_half_width: 0.35       # m; corridor half-width the clearance is measured in -- a
                                    # CORRIDOR not a cone, so hallway walls being passed don't
@@ -123,9 +276,66 @@ controller_server:
       #   0.35 m/s -> 0.70 m   (same as before)
       #   0.70 m/s -> 1.40 m
       # set lookahead_time: 0.0 to disable and fall back to lookahead_dist above
-      lookahead_time: 2.0
+      # DISABLED 2026-08-25 (0.0 = off, falls back to the tuned fixed lookahead_dist 0.7).
+      # Only needed because a fixed lookahead is wrong at a speed it was not tuned for.
+      # OLD: lookahead_time: 2.0
+      lookahead_time: 0.0
       lookahead_min: 0.5
       lookahead_max: 2.0
+      # Clearance-based speed limit (2026-08-20). Fixes the robot getting stuck in congested
+      # space -- which only started after the speed raise. collision_monitor predicts 1.2 s
+      # ahead AND rotates the footprint while doing so, and that swept area grows with speed
+      # while the robot's physical turning geometry does not:
+      #     full lock, lateral room needed:  0.20 m/s -> 0.56 m | 0.50 m/s -> 0.91 m
+      # Congested gaps are 0.6-1.0 m, so the 0.50 m/s sweep does not fit -> collision_monitor
+      # zeroes cmd_vel -> robot stops -> the controller's "commanding forward but not moving"
+      # detector fires a reverse 1.5 s later -> forward, vetoed, reverse... loop.
+      # Resulting speeds: 0.8 m clearance -> 0.20 m/s, 1.2 m -> 0.30, 2.0 m+ -> full 0.50.
+      # Set speed_clearance_factor: 1.0 to disable.
+      speed_clearance_min: 0.80
+      speed_clearance_max: 2.00
+      # DISABLED 2026-08-25 (1.0 = off). Only ever existed to stop the collision monitor
+      # sweep outgrowing congested gaps at 0.50 m/s. At 0.20 m/s the sweep fits anyway, and
+      # leaving it on would cut an already slow robot to 0.08 m/s in tight spots.
+      # OLD: speed_clearance_factor: 0.40
+      speed_clearance_factor: 1.0
+      # Bypass-side preference (2026-08-31). While the corridor ahead is blocked (clearance
+      # <= blend_obstacle_dist), if one side is clearer than the other by more than
+      # bypass_margin, the steering SIGN is forced toward that side. The magnitude is left
+      # alone, so the policy still decides how hard to turn -- only which way is overridden.
+      # Without this nothing chose the bypass side on clearance: pure pursuit just follows
+      # wherever the plan goes and the policy does whatever it learned, so either could commit
+      # to the tighter side and then get stuck.
+      # Set bypass_prefer_open: 0.0 to disable.
+      # DISABLED 2026-09-01, one day after it was added. The intent was "always go round an
+      # obstacle on the side with more room", but the gate is far too wide: it fires whenever
+      # frontCorridorMin(0.35) <= blend_obstacle_dist (1.2 m), which indoors is true near
+      # almost any wall, corner or turn -- not just when actually blocked by something.
+      # Every time it fires it FORCES the steering sign toward whichever side is emptier,
+      # overriding both pure pursuit (which is tracking the plan) and the policy. The robot
+      # therefore drifted steadily toward open space and away from the plan, which looked
+      # exactly like "prioritising clearance over the goal" -- but was the CONTROLLER doing
+      # it, not the planner.
+      # If this is ever re-enabled it needs a much tighter gate (e.g. clearance <= 0.6 m, i.e.
+      # genuinely blocked rather than merely near something) and probably a cross-track guard
+      # so it cannot fight rejoin_cross_track.
+      # OLD: bypass_prefer_open: 1.0
+      # RE-ENABLED and rewritten 2026-09-14. The version disabled on 09-01 asked "which side
+      # has MORE clearance?" -- a continuous preference for openness, which by definition pulls
+      # the robot into open space and away from the goal. That is why it took long detours; the
+      # design was wrong, not the tuning.
+      # Now clearance is only a FEASIBILITY TEST: a side is passable or it is not, and extra
+      # room beyond "the robot fits" counts for nothing. Among passable sides the GOAL decides.
+      # The gate is also much tighter -- it watches the narrow estop_half_width lane, so a wall
+      # being driven past no longer counts as blocked (that was the 09-01 failure).
+      # The chosen side is latched until the lane clears past bypass_clear_dist, so the robot
+      # commits to one side instead of flip-flopping.
+      # Set bypass_prefer_open: 0.0 to disable.
+      bypass_prefer_open: 1.0
+      bypass_trigger_dist: 1.5
+      bypass_clear_dist: 2.0
+      bypass_need_open: 0.35
+      # bypass_margin: no longer used by the rewritten logic (kept out deliberately)
       curve_slowdown: 0.4          # fraction of throttle_scale given up at full steering lock
       rejoin_cross_track: 0.45     # m off the plan -> pure pursuit takes over to rejoin
       max_cross_track: 1.2         # m off the plan for max_cross_track_sec -> fail the
@@ -141,6 +351,15 @@ controller_server:
     # second controller_id here instead of being the only option. Runs at the shared
     # controller_frequency (30 Hz, set for RL above) rather than TEB's own usual 10 Hz --
     # acceptable since this is a last-resort fallback, not the tuned primary path.
+    # 2026-08-24: NO LONGER REACHED. The BT's RLThenTEBFallback was removed -- see the
+    # comment in navigate_to_pose_w_replanning_and_recovery_ackermann.xml. Kept here so it can
+    # still be selected by parameter, but DO NOT re-enable it as a fallback until these are
+    # fixed, because as configured it freezes the robot rather than rescuing it:
+    #   min_turning_radius: 0.7  -> the real minimum is wheelbase/tan(0.60) = 0.32 m, so TEB
+    #                               believes it is 2.2x less manoeuvrable than it is
+    #   allow_init_with_backwards_motion: False -> cannot reverse away from a static obstacle,
+    #                               which is exactly the case that made the BT switch to it
+    #   footprint_model circular radius 0.05 -> a 5 cm dot for a 0.48 x 0.26 m car
     FollowPathTEB:
       plugin: teb_local_planner::TebLocalPlannerROS
 

@@ -10,7 +10,7 @@ from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, Opaq
 def launch_setup(context):
     compiled = os.environ['need_compile']
     sim = LaunchConfiguration('sim', default='true').perform(context)
-    use_joy = LaunchConfiguration('use_joy', default='true').perform(context)
+    use_joy = LaunchConfiguration('use_joy', default='false').perform(context)
     use_depth_camera = LaunchConfiguration('use_depth_camera', default='false')
     master_name = LaunchConfiguration('master_name', default='/').perform(context)
     robot_name = LaunchConfiguration('robot_name', default='/').perform(context)

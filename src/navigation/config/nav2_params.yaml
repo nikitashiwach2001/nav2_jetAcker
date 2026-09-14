@@ -212,6 +212,18 @@ local_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
+          # 2026-08-20: raytrace 3.0 -> 4.0, obstacle 2.5 -> 3.5. An obstacle was only marked
+          # into the costmap once it was within 2.5 m, and the plan then took ~1.1 s more to
+          # route around it, so the robot was already ~1.9 m in before the plan changed.
+          # Marking at 3.5 m buys a full extra metre of reaction distance.
+          # raytrace_max_range must stay ABOVE obstacle_max_range or stale marks never clear.
+          # OLD: raytrace_max_range: 3.0
+          # OLD: obstacle_max_range: 2.5
+          # REVERTED 2026-08-25 to 3.0 / 2.5. Marking further out bought reaction distance at
+          # 0.50 m/s; at 0.20 m/s it only marks more transient clutter, which is part of why
+          # plans started hugging objects.
+          # OLD: raytrace_max_range: 4.0
+          # OLD: obstacle_max_range: 3.5
           raytrace_max_range: 3.0
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
@@ -231,8 +243,40 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 1.0
-      publish_frequency: 1.0
+      # 2026-08-20: 1.0 -> 5.0 (publish 1.0 -> 2.0). The LOCAL costmap already ran at 5 Hz,
+      # so the controller saw a new obstacle instantly while the PLANNER did not hear about
+      # it for a further second. Total time from an obstacle appearing to the global plan
+      # routing around it was lidar 0.13 + costmap 1.0 + BT replan 1.0 + Hybrid-A* 0.30 =
+      # 2.43 s, which at 0.5 m/s is 1.21 m of travel. The robot therefore reached ~1.3 m from
+      # the obstacle while still tracking the OLD plan straight through it -- the policy
+      # steered away, rejoin_cross_track (0.45) handed steering back to pure pursuit which
+      # pulled it back in, and the resulting tug-of-war ended in e-stop -> reverse -> repeat.
+      # That is the '5-6 forward/reverse attempts to bypass one object' behaviour.
+      # OLD: update_frequency: 1.0
+      # OLD: publish_frequency: 1.0
+      # REVERTED 2026-08-25 to 1.0 / 1.0 (this is the GLOBAL costmap; the local one above was
+      # always 5 Hz). The 5 Hz global was to cut replan latency at 0.50 m/s, and it was the
+      # one change that raised CPU load on an already unstable container.
+      # OLD: update_frequency: 5.0
+      # OLD: publish_frequency: 2.0
+      # 2026-09-10: 1.0 -> 5.0 / 2.0 (GLOBAL costmap; the local one was always 5 Hz).
+      # RESTORED after being reverted on 08-25. That revert was aimed at the speed raise, but
+      # this is not a speed parameter -- it is replan latency, and removing it brought back the
+      # dynamic-obstacle problem.
+      # Why it matters: an obstacle only reaches the PLANNER through this costmap. At 1 Hz the
+      # chain from "person steps in front" to "plan routes around them" was
+      # lidar 0.13 + costmap 1.0 + BT replan 1.0 + Hybrid-A* 0.30 = 2.43 s, which at 0.45 m/s
+      # is 1.09 m of travel. The plan therefore only became correct at 1.41 m from the
+      # obstacle -- but blend_clear_dist hands steering to the POLICY at 1.50 m. So the good
+      # plan arrived after the policy had already taken over and was ignoring it, and the
+      # robot never actually drove the route around the obstacle.
+      # It also controls CLEARING: a person who has moved leaves stale marks for up to 1 s.
+      # If nav2_container gets unstable, drop this to 3.0 first -- it is the only change here
+      # that raises CPU load.
+      # OLD: update_frequency: 1.0
+      # OLD: publish_frequency: 1.0
+      update_frequency: 5.0
+      publish_frequency: 2.0
       global_frame: map
       robot_base_frame: base_footprint
       use_sim_time: False
@@ -252,9 +296,31 @@ global_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
-          raytrace_max_range: 3.0
+          # 2026-08-20: raytrace 3.0 -> 4.0, obstacle 2.5 -> 3.5. An obstacle was only marked
+          # into the costmap once it was within 2.5 m, and the plan then took ~1.1 s more to
+          # route around it, so the robot was already ~1.9 m in before the plan changed.
+          # Marking at 3.5 m buys a full extra metre of reaction distance.
+          # raytrace_max_range must stay ABOVE obstacle_max_range or stale marks never clear.
+          # OLD: raytrace_max_range: 3.0
+          # OLD: obstacle_max_range: 2.5
+          # REVERTED 2026-08-25 to 3.0 / 2.5. Marking further out bought reaction distance at
+          # 0.50 m/s; at 0.20 m/s it only marks more transient clutter, which is part of why
+          # plans started hugging objects.
+          # OLD: raytrace_max_range: 4.0
+          # OLD: obstacle_max_range: 3.5
+          # 2026-09-10: 3.0 / 2.5 -> 4.0 / 3.5 on the GLOBAL costmap only (the local one stays
+          # at 2.5 -- it is a 3x3 m rolling window, so a longer range there buys nothing).
+          # This is where an obstacle first becomes visible to the planner, so it sets how much
+          # runway pure pursuit gets before blend_clear_dist (1.50 m) hands steering to the
+          # policy. Marking at 2.5 m left only 0.49 m of runway even with the faster replan
+          # above; 3.5 m gives 1.49 m (~3.3 s at 0.45 m/s), which is enough to steer around an
+          # obstacle smoothly instead of reaching the e-stop and reversing.
+          # raytrace_max_range must stay ABOVE obstacle_max_range or stale marks never clear.
+          # OLD: raytrace_max_range: 3.0
+          # OLD: obstacle_max_range: 2.5
+          raytrace_max_range: 4.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
+          obstacle_max_range: 3.5
           obstacle_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
@@ -280,8 +346,40 @@ global_costmap:
         # Inflation never blocks anything (only the footprint does), so narrow-but-passable
         # gaps stay usable; they just cost more, and the planner takes an open route instead
         # when one exists.
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.35
+        # 2026-08-31: 3.0/0.35 -> 2.0/0.75 so plans run down the MIDDLE of free space instead
+        # of hugging whichever side happens to be shorter.
+        # nav2 inflation cost is 253*exp(-scale*(d-inscribed)) up to inflation_radius and
+        # EXACTLY ZERO past it. At 0.35 m that meant every point more than 0.35 m from an
+        # obstacle scored identically, so in a 1.4 m corridor the whole central 0.7 m band was
+        # flat zero cost and the planner had no reason to sit in the middle -- it just took the
+        # shortest line, which runs along one wall. That is the one-sided path being seen.
+        # A plan only prefers the centre if the inflation reaches the middle from BOTH walls,
+        # i.e. inflation_radius >= half the corridor width. 0.75 covers corridors up to 1.5 m.
+        # In a 1.4 m corridor the cost now goes 81 -> 109 -> 147 as the robot moves 0, 0.15,
+        # 0.30 m off centre, so the centreline is a genuine minimum.
+        # This does NOT close narrow gaps -- inflation never blocks, only lethal/inscribed
+        # cells do. It makes tight routes more expensive, traded against length by the Smac
+        # planner's cost_penalty (3.5). If it starts taking silly detours, lower cost_penalty
+        # rather than shrinking this radius again.
+        # The LOCAL costmap inflation is deliberately left at 0.25 so the controller can still
+        # squeeze through tight spaces the global plan routes it into.
+        # OLD: cost_scaling_factor: 3.0
+        # OLD: inflation_radius: 0.35
+        # 2026-09-01: scaling 2.0 -> 4.0, radius kept at 0.75.
+        # The 0.75 radius is what makes plans run down the middle, so it stays. But at
+        # scaling 2.0 the ABSOLUTE cost in the open part of a corridor was high (81 at the
+        # centre of a 1.4 m corridor), and with cost_penalty 3.5 that made traversing such a
+        # corridor cost 2.12x its length -- so the planner would go up to 112% out of its way
+        # to avoid one entirely, producing long detours away from the goal.
+        # Centring and corridor-avoidance are different things and can be separated:
+        #   centring needs only a GRADIENT, and costs a few cm of path length
+        #   avoiding a corridor depends on the ABSOLUTE level, and costs metres
+        # A steeper scaling keeps the gradient while collapsing the absolute level -- at 4.0
+        # the same corridor centre costs 26 instead of 81, but still reads 26/39/58/86 as the
+        # robot moves 0/0.1/0.2/0.3 m off centre, so the centreline is just as preferred.
+        # OLD: cost_scaling_factor: 2.0
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.75
       always_send_full_costmap: True
   global_costmap_client:
     ros__parameters:
@@ -344,7 +442,26 @@ planner_server:
       # what makes the planner actually pay to stay off it, instead of taking the short line
       # past an obstacle because the detour costs more than the proximity. Too high and it
       # starts preferring silly detours -- back off toward 2.5 if that shows up.
-      cost_penalty: 3.5
+      # 2026-09-01: 3.5 -> 2.0. This is how heavily Smac weighs costmap cost against path
+      # LENGTH, i.e. how far out of its way the planner will go to avoid expensive cells.
+      # Together with the steeper inflation scaling above it brings the worst-case detour for
+      # a 1.4 m corridor from 112% down to 21%, which still prefers open routes when they are
+      # roughly as short but no longer abandons the direct route to the goal.
+      # OLD: cost_penalty: 3.5
+      # 2026-09-01 (second pass): 2.0 -> 0.5. 2.0 was tuned against a 1.4 m corridor, but this
+      # map's corridors are 0.8-1.2 m, where it still allowed a 31-68% detour -- so the robot
+      # kept abandoning the direct route to the goal in favour of open space.
+      # The asymmetry that makes 0.5 safe: in a straight corridor the centreline and an
+      # off-centre line are the SAME LENGTH, so centring costs no path length at all and needs
+      # only a tiny weight to win. Length only matters at corners (cutting one saves ~0.1-0.3
+      # m), whereas avoiding a corridor costs 10-25 m -- 50-100x more. So a small penalty
+      # separates the two cleanly.
+      # At 0.5, a 1.0 m corridor allows only an 11% detour, while the centring pull over a 10 m
+      # corridor is still 2.65 m of virtual length -- about 9x the biggest corner-cut it has to
+      # beat. Centring survives; long detours do not.
+      # OLD: cost_penalty: 3.5
+      # OLD: cost_penalty: 2.0
+      cost_penalty: 0.5
       retrospective_penalty: 0.015
       lookup_table_size: 20.0
       cache_obstacle_heuristic: false
@@ -515,7 +632,17 @@ collision_monitor:
       # first-attempt give-up rule (travelled < 0.10 && !front_open -> fail "boxed in")
       # in rl_controller_v5.cpp, not this parameter.
       # TRIED 0.8 (1.5x speed near obstacles), reverted:
-      time_before_collision: 1.2
+      # 2026-08-31: 1.2 -> 0.9. collision_monitor projects the footprint forward for this long
+      # AND rotates it on the way, so while turning it demands far more LATERAL room than the
+      # robot actually occupies: at 0.45 m/s and full lock it wanted 0.29 m clear on each side
+      # beyond the 0.26 m body. 0.9 brings that to 0.23 m.
+      # Note this also shrinks the REVERSE veto zone (reverse_speed 0.10 * tbc + 0.18 rear),
+      # 0.30 -> 0.27 m, so backing out of a dead end gets slightly EASIER, not harder -- the
+      # opposite of the assumption behind the earlier revert of this value.
+      # Braking is still safe: worst case stop at 0.45 m/s needs 0.135 m and 0.9 s of horizon
+      # covers 0.40 m.
+      # OLD: time_before_collision: 1.2
+      time_before_collision: 0.9
       # 2026-08-18: 0.1 -> 0.05. collision_monitor quantizes predicted collision time to this
       # step, so the scaled output velocity moves in jumps (0.088 m/s at 0.1 s / 0.70 m/s;
       # 0.044 m/s at 0.05 s). It sits AFTER velocity_smoother in the chain
@@ -523,7 +650,11 @@ collision_monitor:
       # they go straight to the motors, and they doubled when throttle went 0.35 -> 0.70.
       # Costs 2x collision checks/cycle; revert this FIRST if nav2_container gets unstable.
       # OLD: simulation_time_step: 0.1
-      simulation_time_step: 0.05
+      # REVERTED 2026-08-25 to 0.1. The finer step only mattered because the quantisation
+      # jumps scale with speed, and it doubles collision checks on a container that already
+      # segfaults.
+      # OLD: simulation_time_step: 0.05
+      simulation_time_step: 0.1
       # tolerate a few boundary points already grazing the footprint (robot touching a wall)
       # so the RL controller's reverse escape is not zeroed while in contact
       max_points: 8
